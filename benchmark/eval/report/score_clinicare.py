@@ -39,7 +39,7 @@ import tomllib
 from collections import defaultdict
 from datetime import datetime
 
-from clinicare_core import load_full
+from clinicare_core import load_full, verifier_failed
 from clinicare_core.paths import bootstrap
 
 bootstrap(__file__, "eval")
@@ -298,6 +298,10 @@ def load_trial(d: str, task_dir: str | None = None) -> dict | None:
     try:
         rj = json.load(open(rp))
     except Exception:
+        return None
+    if verifier_failed(rj):
+        # The verifier failed before scoring, and its 0.0 is not a verdict: count the trial with the
+        # infrastructure failures (missing_reward), not as a wrong answer. See clinicare_core.rewards.
         return None
     t: dict = {
         "score": int(
@@ -592,7 +596,7 @@ def score_trials(label: str, job: str, trials: list[dict], n_dirs: int, norule: 
     legitimate scored result).
     """
     n = len(trials)
-    missing_reward = n_dirs - n  # trial dir with no reward.json
+    missing_reward = n_dirs - n  # no usable reward: none written, or the verifier failed first
     missing_gt = sum(1 for t in trials if not t["gt"])  # gold still unrecoverable (rare)
     no_report = sum(1 for t in trials if t.get("report_present") == 0)  # agent wrote no deliverable
     med = lambda xs: st.median(xs) if xs else 0
@@ -808,7 +812,10 @@ def main() -> int:
                     "gold recovered from source, so counted in per-class)"
                 )
             if r["missing_reward"]:
-                bits.append(f"{r['missing_reward']} missing reward.json (dropped from n)")
+                bits.append(
+                    f"{r['missing_reward']} unscored: no reward.json, or the verifier failed "
+                    "before scoring (dropped from n)"
+                )
             if r["missing_gt"]:
                 bits.append(f"{r['missing_gt']} gold unrecoverable (excluded from per-class/clean)")
             print(f"   {r['label']}: {r['n']}/{r['n_dirs']} scored — " + "; ".join(bits))

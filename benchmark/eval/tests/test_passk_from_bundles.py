@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 
+from clinicare_core import VERIFIER_FAILED_KEYS
 from clinicare_core.paths import bootstrap
 
 bootstrap(__file__, "report")
@@ -57,12 +58,18 @@ def write_trial(
     reward: bool = True,
     grades: bool = True,
     suffix: str = "aaa",
+    extra: dict | None = None,
 ) -> None:
     v = os.path.join(root, prefix, f"{tid}__{suffix}", "verifier")
     os.makedirs(v, exist_ok=True)
     if reward:
         json.dump(
-            {"outcome_score": float(correct), "outcome_label_parsed": 1, "report_present": 1},
+            {
+                "outcome_score": float(correct),
+                "outcome_label_parsed": 1,
+                "report_present": 1,
+                **(extra or {}),
+            },
             open(os.path.join(v, "reward.json"), "w"),
         )
     if grades:
@@ -137,6 +144,20 @@ def main() -> int:
         # ---- a trial with no reward.json is not gradeable (same rule as score_clinicare)
         write_trial(root, "D", "t9-ffffff", correct=1, gold="YES", verdict="YES", reward=False)
         check("no reward.json -> not gradeable", len(pfb.read_bundle_local(root, "D")), 0)
+
+        # ---- a reward written by a verifier that failed before scoring is not gradeable either: its
+        # 0.0 is not a verdict, so counting it would score an unchecked trial as a wrong answer.
+        for i, key in enumerate(VERIFIER_FAILED_KEYS):
+            write_trial(
+                root, f"V{i}", "t7-hhhhhh", correct=0, gold="YES", verdict="NO", extra={key: 1}
+            )
+            check(f"{key} -> not gradeable", len(pfb.read_bundle_local(root, f"V{i}")), 0)
+        # The local copy (this script runs without the package installed) must match the rule.
+        check(
+            "VERIFIER_FAILED_KEYS matches clinicare_core",
+            pfb.VERIFIER_FAILED_KEYS,
+            VERIFIER_FAILED_KEYS,
+        )
 
         # ---- reward.json WITHOUT grades_detail.json is also not gradeable. Admitting it counted the
         # trial in n_com while no per-class bucket could hold it, so the supports stopped summing to

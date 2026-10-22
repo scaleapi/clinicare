@@ -25,6 +25,10 @@ Interface (matches `harbor.metrics.uv_script.UvScript`):
     `rewards.jsonl` = one trial's reward dict per line (or literal `null` if the trial
     failed before verification); `metric.json` = a flat {name: float|int} dict.
 
+A reward whose verifier failed before scoring (``rubrics_load_failed`` / ``judge_launch_failed``)
+is treated like a ``null``: it counts in ``n_trials`` and ``n_verifier_failed``, not in
+``n_completed`` or any mean, because its ``score: 0.0`` is a placeholder rather than a verdict.
+
 Rates that a trial leaves undefined (omitted from its reward dict) are averaged only over
 the trials that reported them. Policy outcome is split by condition (policy-on vs -off)
 since the expected behavior differs.
@@ -45,6 +49,11 @@ import argparse
 import json
 from pathlib import Path
 
+# clinicare_core.rewards.VERIFIER_FAILED_KEYS, kept local because harbor runs this file as a
+# dependency-free uv script. A verifier that fails before scoring still writes score 0.0, so a
+# reward carrying one of these keys is unscored, not a wrong answer. A test checks the copies match.
+VERIFIER_FAILED_KEYS = ("rubrics_load_failed", "judge_launch_failed")
+
 
 def _mean(xs: list[float]) -> float:
     return (sum(xs) / len(xs)) if xs else 0.0
@@ -58,6 +67,7 @@ def main() -> None:
 
     rewards: list[dict] = []
     n_trials = 0
+    n_unscored = 0
     for raw in args.input.read_text().splitlines():
         line = raw.strip()
         if not line:
@@ -65,7 +75,11 @@ def main() -> None:
         n_trials += 1
         if line == "null":
             continue
-        rewards.append(json.loads(line))
+        reward = json.loads(line)
+        if any(reward.get(key) == 1 for key in VERIFIER_FAILED_KEYS):
+            n_unscored += 1  # counted in n_trials, kept out of n_completed and every mean
+            continue
+        rewards.append(reward)
 
     def col(key: str) -> list[float]:
         """Values of `key` across trials that reported it (skips undefined/omitted)."""
@@ -79,6 +93,7 @@ def main() -> None:
     metric: dict[str, float | int] = {
         "n_trials": n_trials,
         "n_completed": len(rewards),
+        "n_verifier_failed": n_unscored,
         "completion_rate": (len(rewards) / n_trials) if n_trials else 0.0,
         "n_policy_on": len(on),
         "n_policy_off": len(off),

@@ -365,7 +365,11 @@ def build_cmd(
     gen: str = "",
     max_retries: int | None = None,
     dry_run: bool = False,
+    job: str | None = None,
+    extra: tuple[str, ...] = (),
 ) -> list[str]:
+    """`job` overrides the derived job name; `extra` is appended verbatim (run_case.py passes
+    `-i <task id> -o <jobs dir>` to run one task of a dataset into a caller-chosen job dir)."""
     cmd = [
         HARBOR,
         "run",
@@ -394,7 +398,7 @@ def build_cmd(
     # reasoning-effort axis: harbor passes it as an agent kwarg (codex -> -c model_reasoning_effort,
     # gemini -> thinkingConfig, claude-code -> --effort). Suffix the job name so effort runs don't
     # collide with the baseline job (and pool separately when scored).
-    jn = job_name(system.tag, tasks) + gen + (f"_eff-{effort}" if effort else "")
+    jn = job or job_name(system.tag, tasks) + gen + (f"_eff-{effort}" if effort else "")
     cmd += [
         *creds(system.creds, dry_run),
         *system.web_off,
@@ -418,7 +422,7 @@ def build_cmd(
     # excluded, so a genuine 5400 s ceiling hit is still terminal and is NOT silently re-attempted.
     if max_retries is not None:
         cmd += ["--max-retries", str(max_retries)]
-    return cmd
+    return cmd + list(extra)
 
 
 def select(spec: str) -> list[System]:
@@ -426,6 +430,106 @@ def select(spec: str) -> list[System]:
         return SYSTEMS
     tags = set(spec.split(","))
     return [a for a in SYSTEMS if a.group == spec or a.tag in tags]
+
+
+def preflight(systems: list[System], tasks: str, backend: str) -> int:
+    """Refuse a run that cannot work (missing key/secret, unbuilt tasks, a gateway the build
+    can't reach) and warn about orphaned sidecars. 0 = go, 1 = refused (message on stderr).
+    Shared by run_sweep.py and run_case.py; callers skip it on --dry-run.
+    """
+    # Check only the keys the SELECTED systems actually need — requiring all three would stop
+    # someone running a single-vendor sweep.
+    needed = {"MIMIC_API_SECRET"} | {
+        {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+        }[a.creds]
+        for a in systems
+    }
+    for var in sorted(needed):
+        if not os.environ.get(var):
+            print(
+                f"{var} not set -- `set -a; source .env; set +a` at the repo root first "
+                "(the file is plain KEY=VAL, so it must be exported)",
+                file=sys.stderr,
+            )
+            return 1
+    if not (BASE / tasks).is_dir():
+        print(
+            f"task dir not found: {tasks} -- build it with build_tasks.py first",
+            file=sys.stderr,
+        )
+        return 1
+    if unreachable := gateway_not_allowlisted(tasks, systems):
+        for var, host in unreachable:
+            print(
+                f"{var} points at {host}, which is NOT in the allowed_hosts baked into "
+                f"{tasks} — that build predates the current {var}. The egress sidecar would "
+                f"block it, and the agent reports a misleading TLS error after a multi-minute "
+                f"hang rather than a refusal.\n"
+                f"  Rebuild with {var} set as it is now (build_tasks allowlists it automatically):\n"
+                f"    uv run python benchmark/scripts/build_tasks.py",
+                file=sys.stderr,
+            )
+        return 1
+    # Pre-flight orphan guard (docker only): stale sidecar containers from failed teardowns pile up and
+    # starve new trials (RuntimeError / "cannot stop container"). Warn if many are already live so we
+    # clean first. Root trigger is too much concurrency -> keep to <=2 sweeps at once and a modest -n.
+    if backend == "docker":
+        try:
+            imgs = subprocess.run(
+                ["docker", "ps", "--format", "{{.Image}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            ).stdout
+            stale = sum(
+                1
+                for l in imgs.splitlines()
+                # Match the configured image repo, not a hardcoded name: env_image resolves it
+                # (CLINICARE_IMAGE_REPO), and a stale literal here makes this check silently
+                # never fire rather than error.
+                if _IMAGE_REPO in l or "egress-control-sidecar" in l
+            )
+            if stale > 24:
+                print(
+                    f"WARNING: {stale} mimic/egress sidecar containers already running -- likely "
+                    f"orphans that will starve this sweep. Clear them with\n"
+                    f"    docker rm -f $(docker ps -q --filter ancestor={_IMAGE_REPO})\n"
+                    f"  and avoid >2 concurrent sweeps / high -n.",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
+
+    return 0
+
+
+def child_env(backend: str) -> dict[str, str] | None:
+    """The environment harbor runs with, or None (message on stderr) if the backend can't run."""
+    env = os.environ.copy()
+    if backend == "modal":
+        # There is no default sidecar to fall back on. The compose overlay does not apply on
+        # modal, so you must host one yourself and point MIMIC_TOOLS_URL at it. Refusing here
+        # beats launching every trial only for each to die at its first tool call.
+        if not env.get("MIMIC_TOOLS_URL"):
+            print(
+                "MIMIC_TOOLS_URL is not set. The modal backend cannot start the sidecar for you "
+                "(the docker-compose overlay applies only to --backend docker) — host one and "
+                "point MIMIC_TOOLS_URL at it, or use --backend docker. See "
+                "packages/mimic_tools/SIDECAR.md.",
+                file=sys.stderr,
+            )
+            return None
+    else:
+        env.pop(
+            "MIMIC_TOOLS_URL", None
+        )  # docker: the compose overlay hardcodes the local sidecar (mimic-tools.internal:8799), so
+        # a stray .env value can't redirect a "local" run at the DEPLOYED sidecar. Popping keeps the
+        # docker-compose interpolation environment clean too.
+
+    return env
 
 
 def main() -> int:
@@ -480,93 +584,11 @@ def main() -> int:
     if not systems:
         print(f"no systems match {args.systems!r}", file=sys.stderr)
         return 1
-    if not args.dry_run:
-        # Check only the keys the SELECTED systems actually need — requiring all three would stop
-        # someone running a single-vendor sweep.
-        needed = {"MIMIC_API_SECRET"} | {
-            {
-                "anthropic": "ANTHROPIC_API_KEY",
-                "openai": "OPENAI_API_KEY",
-                "gemini": "GEMINI_API_KEY",
-            }[a.creds]
-            for a in systems
-        }
-        for var in sorted(needed):
-            if not os.environ.get(var):
-                print(
-                    f"{var} not set -- `set -a; source .env; set +a` at the repo root first "
-                    "(the file is plain KEY=VAL, so it must be exported)",
-                    file=sys.stderr,
-                )
-                return 1
-    if not args.dry_run and not (BASE / args.tasks).is_dir():
-        print(
-            f"task dir not found: {args.tasks} -- build it with build_tasks.py first",
-            file=sys.stderr,
-        )
+    if not args.dry_run and (rc := preflight(systems, args.tasks, args.backend)):
+        return rc
+    env = child_env(args.backend)
+    if env is None:
         return 1
-    if not args.dry_run and (unreachable := gateway_not_allowlisted(args.tasks, systems)):
-        for var, host in unreachable:
-            print(
-                f"{var} points at {host}, which is NOT in the allowed_hosts baked into "
-                f"{args.tasks} — that build predates the current {var}. The egress sidecar would "
-                f"block it, and the agent reports a misleading TLS error after a multi-minute "
-                f"hang rather than a refusal.\n"
-                f"  Rebuild with {var} set as it is now (build_tasks allowlists it automatically):\n"
-                f"    uv run python benchmark/scripts/build_tasks.py",
-                file=sys.stderr,
-            )
-        return 1
-    # Pre-flight orphan guard (docker only): stale sidecar containers from failed teardowns pile up and
-    # starve new trials (RuntimeError / "cannot stop container"). Warn if many are already live so we
-    # clean first. Root trigger is too much concurrency -> keep to <=2 sweeps at once and a modest -n.
-    if not args.dry_run and args.backend == "docker":
-        try:
-            imgs = subprocess.run(
-                ["docker", "ps", "--format", "{{.Image}}"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            ).stdout
-            stale = sum(
-                1
-                for l in imgs.splitlines()
-                # Match the configured image repo, not a hardcoded name: env_image resolves it
-                # (CLINICARE_IMAGE_REPO), and a stale literal here makes this check silently
-                # never fire rather than error.
-                if _IMAGE_REPO in l or "egress-control-sidecar" in l
-            )
-            if stale > 24:
-                print(
-                    f"WARNING: {stale} mimic/egress sidecar containers already running -- likely "
-                    f"orphans that will starve this sweep. Clear them with\n"
-                    f"    docker rm -f $(docker ps -q --filter ancestor={_IMAGE_REPO})\n"
-                    f"  and avoid >2 concurrent sweeps / high -n.",
-                    file=sys.stderr,
-                )
-        except Exception:
-            pass
-
-    env = os.environ.copy()
-    if args.backend == "modal":
-        # There is no default sidecar to fall back on. The compose overlay does not apply on
-        # modal, so you must host one yourself and point MIMIC_TOOLS_URL at it. Refusing here
-        # beats launching every trial only for each to die at its first tool call.
-        if not env.get("MIMIC_TOOLS_URL"):
-            print(
-                "MIMIC_TOOLS_URL is not set. The modal backend cannot start the sidecar for you "
-                "(the docker-compose overlay applies only to --backend docker) — host one and "
-                "point MIMIC_TOOLS_URL at it, or use --backend docker. See "
-                "packages/mimic_tools/SIDECAR.md.",
-                file=sys.stderr,
-            )
-            return 1
-    else:
-        env.pop(
-            "MIMIC_TOOLS_URL", None
-        )  # docker: the compose overlay hardcodes the local sidecar (mimic-tools.internal:8799), so
-        # a stray .env value can't redirect a "local" run at the DEPLOYED sidecar. Popping keeps the
-        # docker-compose interpolation environment clean too.
 
     # generation tag first, then effort -> cbench_sweep_<system>[_<variant>]_<gen>[_eff-<level>]
     gen_sfx = ("_" + args.job_suffix.lstrip("_")) if args.job_suffix else ""

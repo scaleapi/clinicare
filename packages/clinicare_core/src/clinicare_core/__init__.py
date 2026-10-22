@@ -19,9 +19,11 @@ Deliberately NOT in here:
 
 from .cohort import by_scenario, cohort_dir, load_dev, load_full, write_full
 from .env import load_env
+from .rewards import VERIFIER_FAILED_KEYS, verifier_failed, write_reward_atomic
 from .taskids import param_hash, param_key, task_id
 
 __all__ = [
+    "VERIFIER_FAILED_KEYS",
     "by_scenario",
     "cohort_dir",
     "load_dev",
@@ -30,5 +32,7 @@ __all__ = [
     "param_hash",
     "param_key",
     "task_id",
+    "verifier_failed",
     "write_full",
+    "write_reward_atomic",
 ]

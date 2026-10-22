@@ -19,6 +19,11 @@ from pathlib import Path
 
 _LINE = re.compile(r"\s*([A-Z_][A-Z0-9_]*)=(.*)")
 _INTERP = re.compile(r"\$\{(\w+)\}")
+# An unquoted value ends where the shell would end it: at whitespace followed by `#`.
+_TRAILING_COMMENT = re.compile(r"\s+#.*$")
+_LEADING_COMMENT = re.compile(r"\s+#")
+# Inside double quotes the shell treats a backslash as an escape only before these characters.
+_DQ_ESCAPABLE = '"\\$`'
 # Markers of the repo root, in priority order, for the no-argument case.
 _ROOT_MARKERS = (".env", "pyproject.toml", ".git")
 
@@ -30,6 +35,44 @@ def find_root(start: Path | None = None) -> Path | None:
         if any((d / m).exists() for m in _ROOT_MARKERS):
             return d
     return None
+
+
+def _double_quoted(raw: str) -> str | None:
+    """The value of a `"..."` string as the shell reads it, or None if it never closes."""
+    out, i = [], 1
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw) and raw[i + 1] in _DQ_ESCAPABLE:
+            out.append(raw[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            return "".join(out)
+        out.append(c)
+        i += 1
+    return None
+
+
+def _value(raw: str) -> str:
+    """A `.env` value as `set -a; source .env` would read it, so the two load paths agree.
+
+    `.env.template` ships lines like `MCP_TIMEOUT=120000   # claude-code handshake (ms)`; keeping
+    the comment would hand `int()` a string with the comment still attached.
+    """
+    if _LEADING_COMMENT.match(raw):  # `KEY=   # note` is an empty value
+        return ""
+    raw = raw.strip()
+    # Quoted: the value ends at the closing quote, and a comment may follow. Single quotes are
+    # literal; double quotes honour backslash escapes (`"pa\\"ss"` is `pa"ss`).
+    if raw[:1] == '"':
+        value = _double_quoted(raw)
+        if value is not None:
+            return value
+    elif raw[:1] == "'":
+        end = raw.find("'", 1)
+        if end != -1:
+            return raw[1:end]
+    return _TRAILING_COMMENT.sub("", raw)
 
 
 def load_env(root: Path | None = None) -> dict[str, str]:
@@ -48,7 +91,7 @@ def load_env(root: Path | None = None) -> dict[str, str]:
                 continue
             m = _LINE.match(line)
             if m:
-                parsed[m.group(1)] = m.group(2).strip()
+                parsed[m.group(1)] = _value(m.group(2))
 
         # Expand against the file's own values first, then the process environment, so a
         # `.env` line like JUDGE_API_KEY=${OPENAI_API_KEY} resolves either way.

@@ -107,6 +107,33 @@ has no MIMIC access at all. `--dry-run` prints the exact harbor command it would
 `grade.py` runs the LLM-judged and grounding metrics and then the report; add `--skip-llm` for
 the deterministic subset only (no judge credentials, no spend).
 
+### Run one case (for wrappers such as MedHELM)
+
+`scripts/run_case.py` runs a single task with one system into a job dir you name, and prints the
+trial as one JSON line. It builds the same harbor command as `run_sweep.py` and loads `.env`
+itself, so a wrapper needs only a system tag and a task id:
+
+```bash
+uv run python scripts/run_case.py --system codex-gpt56sol --task-id <task id> \
+    --jobs-dir jobs/medhelm --job-name <unique name>      # add --grade for the LLM-judged axes
+```
+
+```json
+{"status": "ok", "trial_dir": "...", "task_id": "...", "model_name": "openai/gpt-5.6-sol",
+ "agent_name": "...", "agent_version": "...", "exception_type": null, "task_checksum": "...",
+ "graded": true,
+ "grading": {"process": {"outcome": "scored", "reason": "scored", "detail": null},
+             "policy": {"outcome": "skipped", "reason": "policy_off", "detail": null}}}
+```
+
+`status` is `ok` (scored), `agent_error` (scored, but the agent raised, e.g. a timeout), or
+`dead` (setup or environment failure, so unscored). Harbor exits 0 in all three cases, so read
+`status`, not the exit code. With `--grade`, `grading` says what each LLM judge did and why, so a failure can be traced to its cause: `skipped` is by design (`no_report` means the agent wrote no report; `policy_off` and `no_*_rubrics` mean there was nothing to score), and `failed` names a judge credentials problem (`judge_credentials_missing`, `judge_credentials_rejected`), a judge or API error (`judge_error`, with the exception in `detail`), a task-build problem (`no_rubrics`), or a crashed judge script (`judge_script_failed`). `graded` is true when no judge failed. The full list is in the `run_case.py` docstring. Exit 2 means there is no trustworthy trial to report: a usage or
+preflight error, harbor refusing the job, a trial whose `result.json` or `reward.json` cannot be
+parsed, or a finished trial built from a different version of the task. Re-running with the same `--job-name` returns the finished trial without re-running it,
+but only while the task is unchanged (harbor's task checksum). After a CliniCARE update or a task
+rebuild, use a new `--job-name`.
+
 ## How scoring works
 
 The **outcome** score is deterministic and needs no LLM and no credentials: the in-container

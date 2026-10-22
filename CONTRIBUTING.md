@@ -53,7 +53,7 @@ uvx ruff format . && uvx ruff check .
 
 # Scoring and grounding. Runs offline against fixtures — no credentials, no network, no spend.
 # (Set JUDGE_BASE_URL/JUDGE_API_KEY/JUDGE_MODEL to additionally exercise the LLM-judged paths.)
-for t in benchmark/eval/tests/test_*.py; do uv run python "$t" || break; done
+for t in benchmark/eval/tests/test_*.py scripts/tests/test_*.py; do uv run python "$t" || break; done
 
 # The tool surface, against your Parquet tree. Exercises every tool on one patient.
 MIMIC_DATA_ROOT=/path/to/mimic-parquet uv run python packages/mimic_tools/smoke_test.py

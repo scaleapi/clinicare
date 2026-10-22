@@ -29,6 +29,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from clinicare_core import write_reward_atomic
 from clinicare_core.paths import bootstrap
 
 EVAL = Path(__file__).resolve().parents[1]  # benchmark/eval
@@ -183,7 +184,7 @@ def amend_reward(trial: Path, payload: dict) -> bool:
     for key in ("policy_citation_support_rate", "policy_citation_correct_rate"):
         if payload.get(key) is not None:
             reward[key] = payload[key]
-    rp.write_text(json.dumps(reward, indent=2))
+    write_reward_atomic(rp, reward)  # a run_case.py sharing this job may be reading it
     return True
 
 

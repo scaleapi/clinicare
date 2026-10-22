@@ -46,6 +46,11 @@ import re
 import statistics
 import sys
 
+# reward.json markers of a verifier that failed before scoring (its 0.0 is not a verdict). A copy of
+# clinicare_core.rewards.VERIFIER_FAILED_KEYS, kept local because this script runs under a bare
+# `python3` with no package installed; tests/test_passk_from_bundles.py asserts the two are equal.
+VERIFIER_FAILED_KEYS = ("rubrics_load_failed", "judge_launch_failed")
+
 # Display name and system slug for the REPEATED-RUN RELIABILITY tables, in the order the paper
 # prints them. These five are the systems run with k=3 on the development subset — NOT the 16-system
 # leaderboard, which is a different (larger) set. Row order is data, not presentation: reordering
@@ -94,7 +99,8 @@ def read_bundle_local(root: str, prefix: str) -> dict[str, dict]:
 
 
 def _read_trial(vdir: str) -> dict | None:
-    """None when the trial is not gradeable (no reward.json) -- the same rule score_clinicare uses."""
+    """None when the trial is not gradeable -- no reward.json, or one written by a verifier that failed
+    before scoring (clinicare_core.rewards) -- the same rule score_clinicare uses."""
     rp, gp = os.path.join(vdir, "reward.json"), os.path.join(vdir, "grades_detail.json")
     if not os.path.exists(rp):
         return None
@@ -102,6 +108,8 @@ def _read_trial(vdir: str) -> dict | None:
         rj = json.load(open(rp))
     except (OSError, json.JSONDecodeError):
         return None
+    if any(rj.get(key) == 1 for key in VERIFIER_FAILED_KEYS):
+        return None  # the verifier failed before scoring: its 0.0 is not a verdict
     gold = verdict = None
     if os.path.exists(gp):
         try:
