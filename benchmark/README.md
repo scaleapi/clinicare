@@ -90,6 +90,10 @@ build the tasks with it exported: `build_tasks.py` allowlists that host for you.
 allowlist is baked in at build time, tasks built before you set it cannot reach the gateway.
 The ten native systems need only the vendor API keys.
 
+`--systems medhelm` runs five models MedHELM evaluates that postdate the paper, set up by the same
+rule: Claude Opus 5.5 on Claude Code, GPT-6 Astra on Codex, Gemini 3.8 Flash on Gemini CLI, and
+Qwen3.8 Max and Muse Spark 1.3, which have no CLI of their own, on `opencode` through the gateway.
+
 ### Keeping runs apart
 
 Each build lands in its own directory, so no build overwrites another:
