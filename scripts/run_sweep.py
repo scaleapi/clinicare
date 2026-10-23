@@ -254,10 +254,19 @@ SYSTEMS: list[System] = [
         [],
     ),
     # --- opencode: the six open-weight models, the paper's controlled comparison ---
+    # All six run the repo-local OpenCodeLocalXDG shim, not harbor's stock `opencode`, for the same
+    # kind of reason the codex arms run CodexMcpFixed. The stock adapter (a) reinstalls the harness
+    # inside every trial via nvm + `npm i -g opencode-ai`, which is redundant now that the binary is
+    # baked into the trial image and is where a gpt-oss sweep lost 1,169 attempts to exit 137, and
+    # (b) hardcodes opencode's XDG dirs onto the /logs bind mount. /logs is the job dir, which is on
+    # EFS here; opencode keeps a SQLite session DB there and WAL mode mmaps its -shm file, which over
+    # NFS raises SIGBUS -> "Bun has crashed" -> empty report -> a silent score of 0 (~48% of one muse
+    # sweep). Reverting any of these to a bare `opencode` silently reinstates both failure modes,
+    # and neither announces itself in the metrics -- so keep them in step with the shim.
     System(
         "opencode-ds4pro",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/deepseek-v4-pro",
         "openai",
         WEB_OFF_OPENCODE,
@@ -265,7 +274,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-ds4flash",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/deepseek-v4-flash",
         "openai",
         WEB_OFF_OPENCODE,
@@ -273,7 +282,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-qwen37",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/qwen3p7-plus",
         "openai",
         WEB_OFF_OPENCODE,
@@ -281,7 +290,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-glm52",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/glm-5p2",
         "openai",
         WEB_OFF_OPENCODE,
@@ -289,7 +298,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-minimaxm3",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/minimax-m3",
         "openai",
         WEB_OFF_OPENCODE,
@@ -297,7 +306,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-kimik2p7",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/kimi-k2p7-code",
         "openai",
         WEB_OFF_OPENCODE,
