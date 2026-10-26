@@ -140,8 +140,50 @@ RUN case "${TARGETARCH:-amd64}" in \
 # (sidecar.compose.yml), because it must read the operator's host Parquet tree through a bind
 # mount whose uid we do not control. It holds no shell for the agent — only the HTTP tool
 # surface — so it is not the container this hardening is about.
+# Node + opencode, baked in — same reasoning as claude-code and codex above, and for a sharper
+# reason. harbor's opencode adapter installs the harness INSIDE EVERY TRIAL:
+#
+#     nvm install 22 && npm i -g opencode-ai@latest
+#
+# On a 750-task sweep that is 750 Node downloads and 750 npm resolutions. It is the only remaining
+# per-trial network install in the image, and it is where sweeps die: a gpt-oss run lost 1,169
+# attempts to `exit 137` (SIGKILL) during `npm i -g`, with the host showing 1.7 TB free memory,
+# 4% inode use and low memory pressure — i.e. not a host OOM, but a failure mode we could not
+# pin down and could not stop hitting. Baking removes the variable rather than scheduling around it.
+#
+# It also fixes reproducibility: `@latest` is unpinned, so the harness silently drifted mid-project
+# (nemotron's 750 ran opencode 1.18.21; muse's ran 1.18.23). OPENCODE_VERSION below is now the
+# single source of truth — bump it deliberately, the way CLAUDE_CODE_VERSION and CODEX_VERSION are.
+#
+# The .tar.gz build is deliberate: python:3.11-slim ships no xz-utils, so `tar -J` fails.
+# Installed as ROOT into /usr/local (before `USER agent`), so the agent cannot patch its own
+# harness — the same property the comment below claims for the other CLIs. harbor's adapter has no
+# "already installed" check of its own, unlike claude-code/codex, so the repo-local
+# OpenCodeLocalXDG shim overrides install() to skip when `opencode` is already on PATH.
+ARG NODE_VERSION=22.23.2
+ARG OPENCODE_VERSION=1.18.23
+RUN case "${TARGETARCH:-amd64}" in \
+        amd64) NODE_ARCH=x64 ;; \
+        arm64) NODE_ARCH=arm64 ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz" \
+         -o /tmp/node.tar.gz \
+    # --no-same-owner is REQUIRED: the Node tarball carries a numeric uid/gid that does not
+    # exist here, and tar-as-root preserves it, leaving /usr/local/{bin,lib,share} owned by
+    # UNKNOWN:UNKNOWN. Files stay world-readable so `python3` still runs by hand -- but the
+    # harbor verifier, which chowns what it uploads into the container, then fails to write
+    # reward.json and every trial dies with RewardFileNotFoundError.
+    && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 --no-same-owner \
+    && rm -f /tmp/node.tar.gz \
+    && npm i -g "opencode-ai@${OPENCODE_VERSION}" \
+    && npm cache clean --force \
+    && node --version && opencode --version
+
 ARG AGENT_UID=10001
-RUN useradd --create-home --uid "${AGENT_UID}" --shell /bin/bash agent     && mkdir -p /workspace     && chown -R agent:agent /workspace
+RUN useradd --create-home --uid "${AGENT_UID}" --shell /bin/bash agent     && mkdir -p /workspace     && chown -R agent:agent /workspace \
+    && mkdir -p /home/agent/.nvm && : > /home/agent/.nvm/nvm.sh \
+    && chown -R agent:agent /home/agent/.nvm
 
 WORKDIR /workspace
 USER agent

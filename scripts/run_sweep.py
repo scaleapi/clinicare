@@ -15,7 +15,8 @@ Needs MIMIC_API_SECRET, the vendor API key(s) for the systems you run, and JUDGE
 score the LLM-judged axes afterwards. See .env.template.
 
 System groups: `--systems leaderboard` is the paper's 16 systems; `--systems ablation` is the ones used
-only in the ablation sections. `--systems all` is both.
+only in the ablation sections; `--systems medhelm` is the models MedHELM evaluates that the paper
+predates. `--systems all` is every system.
 
 Backends (--backend, default docker):
   docker  : agent and sidecar both run locally; the sidecar is a compose service merged in with
@@ -154,7 +155,7 @@ def creds(family: str, dry_run: bool = False) -> list[str]:
 
 class System(NamedTuple):
     tag: str  # short id -> job name cbench_sweep_<tag>
-    group: str  # "leaderboard" (the paper's 16 systems) or "ablation"
+    group: str  # "leaderboard" (the paper's 16 systems), "ablation" or "medhelm"
     agent: list[str]  # harbor -a args: a built-in name, or a module:Class import path
     model: str  # provider-qualified model id passed to harbor -m
     creds: str  # cred family: "anthropic" | "openai" | "gemini"
@@ -163,11 +164,14 @@ class System(NamedTuple):
 
 # NB: confirm the frontier model ids are live on the proxy before the real run (see --dry-run).
 SYSTEMS: list[System] = [
-    # Each vendor model on its NATIVE CLI, web disabled per harness. Two groups:
+    # Each vendor model on its NATIVE CLI, web disabled per harness. Three groups:
     #   leaderboard — the 16 systems in the paper's main table: 10 production CLIs on their own
     #                 vendor models, plus 6 open-weight models on opencode, the neutral harness.
     #   ablation    — systems that appear only in the ablation sections (policy on/off, repeated-run
     #                 reliability, reasoning effort, and the fixed-model harness comparison).
+    #   medhelm     — models MedHELM evaluates that postdate the paper, set up by the paper's rule:
+    #                 a vendor model with its own production CLI runs on it, and a model without
+    #                 one (Qwen3.8 Max, Muse Spark) runs on opencode.
     #
     # THE OPEN-WEIGHT SYSTEMS NEED A GATEWAY. Their model ids (`openai/fireworks_ai/...`) are routed
     # by an OpenAI-compatible proxy, not by any vendor endpoint, so set OPENAI_BASE_URL to your own
@@ -254,10 +258,19 @@ SYSTEMS: list[System] = [
         [],
     ),
     # --- opencode: the six open-weight models, the paper's controlled comparison ---
+    # All six run the repo-local OpenCodeLocalXDG shim, not harbor's stock `opencode`, for the same
+    # kind of reason the codex arms run CodexMcpFixed. The stock adapter (a) reinstalls the harness
+    # inside every trial via nvm + `npm i -g opencode-ai`, which is redundant now that the binary is
+    # baked into the trial image and is where a gpt-oss sweep lost 1,169 attempts to exit 137, and
+    # (b) hardcodes opencode's XDG dirs onto the /logs bind mount. /logs is the job dir, which is on
+    # EFS here; opencode keeps a SQLite session DB there and WAL mode mmaps its -shm file, which over
+    # NFS raises SIGBUS -> "Bun has crashed" -> empty report -> a silent score of 0 (~48% of one muse
+    # sweep). Reverting any of these to a bare `opencode` silently reinstates both failure modes,
+    # and neither announces itself in the metrics -- so keep them in step with the shim.
     System(
         "opencode-ds4pro",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/deepseek-v4-pro",
         "openai",
         WEB_OFF_OPENCODE,
@@ -265,7 +278,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-ds4flash",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/deepseek-v4-flash",
         "openai",
         WEB_OFF_OPENCODE,
@@ -273,7 +286,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-qwen37",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/qwen3p7-plus",
         "openai",
         WEB_OFF_OPENCODE,
@@ -281,7 +294,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-glm52",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/glm-5p2",
         "openai",
         WEB_OFF_OPENCODE,
@@ -289,7 +302,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-minimaxm3",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/minimax-m3",
         "openai",
         WEB_OFF_OPENCODE,
@@ -297,7 +310,7 @@ SYSTEMS: list[System] = [
     System(
         "opencode-kimik2p7",
         "leaderboard",
-        ["-a", "opencode"],
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
         "openai/fireworks_ai/kimi-k2p7-code",
         "openai",
         WEB_OFF_OPENCODE,
@@ -329,6 +342,48 @@ SYSTEMS: list[System] = [
         "openai/fireworks_ai/deepseek-v4-pro",
         "openai",
         [],
+    ),
+    System(
+        "claude-opus55",
+        "medhelm",
+        ["-a", "claude-code"],
+        "claude-opus-5-5",
+        "anthropic",
+        WEB_OFF_CLAUDE,
+    ),
+    System(
+        "codex-gpt6astra",
+        "medhelm",
+        ["-a", "clinicare_core.agents.codex_mcp_fix:CodexMcpFixed"],
+        "openai/gpt-6-astra",
+        "openai",
+        WEB_OFF_CODEX,
+    ),
+    System(
+        "gemini-38flash",
+        "medhelm",
+        ["-a", "clinicare_core.agents.gemini_no_web:GeminiNoWeb"],
+        "gemini/gemini-3.8-flash",
+        "gemini",
+        [],
+    ),
+    # Qwen3.8 Max and Muse Spark have no production CLI of their own, so they run on opencode like
+    # the open-weight systems, through the same OpenAI-compatible gateway (OPENAI_BASE_URL).
+    System(
+        "opencode-qwen38max",
+        "medhelm",
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
+        "openai/fireworks_ai/qwen3p8-max",
+        "openai",
+        WEB_OFF_OPENCODE,
+    ),
+    System(
+        "opencode-musespark13",
+        "medhelm",
+        ["-a", "clinicare_core.agents.opencode_local_xdg:OpenCodeLocalXDG"],
+        "openai/meta_ai/muse-spark-1.3",
+        "openai",
+        WEB_OFF_OPENCODE,
     ),
 ]
 

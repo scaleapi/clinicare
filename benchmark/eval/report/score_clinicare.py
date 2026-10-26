@@ -225,9 +225,11 @@ def row_label(job_dir: str) -> str:
             # display the harness it wraps so rows read as harness × model.
             spec = raw_name or a["import_path"]
             mod = spec.split(":")[0].split(".")[-1]
-            ident = {"codex_mcp_fix": "codex", "gemini_no_web": "gemini-cli"}.get(
-                mod, mod.replace("_mcp_fix", "").replace("_fix", "").replace("_no_web", "")
-            )
+            ident = {
+                "codex_mcp_fix": "codex",
+                "gemini_no_web": "gemini-cli",
+                "opencode_local_xdg": "opencode",
+            }.get(mod, mod.replace("_mcp_fix", "").replace("_fix", "").replace("_no_web", ""))
         else:
             ident = "?"
         model = (a.get("model_name") or "?").split("/")[-1]
