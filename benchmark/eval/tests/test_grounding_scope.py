@@ -115,9 +115,13 @@ def bash_step(step_id, cmd, content):
             "observation": {"results": [{"source_call_id": f"c{step_id}", "content": content}]}}
 
 
+helper = "cd /workspace && python3 call_mimic.py list_notes subject_id=12014968 hadm_id=20449658"
+readback = "cat /workspace/notes.json"
 traj = {"schema_version": "1", "agent": {"name": "mini-swe-agent", "model_name": "m"},
         "steps": [{"step_id": 1, "source": "user", "message": msg_eq},
-                  bash_step(2, script, ok_out), bash_step(3, script, failed), bash_step(4, script, elided)]}
+                  bash_step(2, script, ok_out), bash_step(3, script, failed), bash_step(4, script, elided),
+                  bash_step(5, helper, json.dumps({"returncode": 0, "output": "wrote notes.json"})),
+                  bash_step(6, readback, json.dumps({"returncode": 0, "output": "{\"note_id\": \"12014968-DS-21\"}"}))]}
 with tempfile.TemporaryDirectory() as d:
     p = Path(d) / "trajectory.json"; p.write_text(json.dumps(traj))
     t = load_trajectory(p)
@@ -125,12 +129,14 @@ tools = [o.tool for o in t.observations]
 check("list_icu_stays recovered twice (ok + elided), not from the failed step", tools.count("list_icu_stays") == 2, str(tools))
 check("a tool only mentioned in a print string is not a call", "get_lab_timeline" not in tools, str(tools))
 check("scope ids carried in args", any(o.tool == "list_icu_stays" and o.args.get("subject_id") == "12014968" for o in t.observations))
+check("tool name as a helper-script argument is a call", "list_notes" in tools, str(tools))
 pooled = [o for o in t.observations if o.tool == EXEC_OUTPUT_TOOL]
-check("stdout pooled as evidence, once per successful step", len(pooled) == 2, str(len(pooled)))
+check("stdout pooled once per successful step, incl. steps that name no tool", len(pooled) == 4, str(len(pooled)))
+check("a note id read back from a file the agent wrote is in the pool", "12014968-DS-21" in t.evidence_text)
 check("elided output pooled as head+tail", any("31929757" in o.text and "18:12:37" in o.text for o in pooled))
 check("stay_id from rows is in the evidence pool", "31929757" in t.evidence_text)
 st = _scope_stats()
-check("R_retrieval credits icustays for the bash trial", "icustays" in retrieved_tables(t.observations, case_scope(t.steps), st) and st["in_scope"] == 2, str(st))
+check("R_retrieval credits icustays + notes for the bash trial", {"icustays", "discharge", "radiology"} <= retrieved_tables(t.observations, case_scope(t.steps), st) and st["in_scope"] == 3, str(st))
 
 print()
 if _fails:

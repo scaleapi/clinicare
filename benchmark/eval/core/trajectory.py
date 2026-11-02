@@ -229,11 +229,15 @@ def parse_exec_script(script: str, step_id: int | None) -> list[Observation]:
 # the sidecar credits nothing. (a) can still over-count a tool named in a dict the script never
 # sends; that is the same minor over-count the exec-scaffold parser accepts, and it affects
 # retrieval coverage (which unions tables) far less than it would a per-call metric.
-# Two shapes count: the name as a whole string literal (`_run_tool("get_note", ...)`,
-# `{"name": "get_note"}`), or the name in call position (`tools.get_note(...)`). A name inside a
-# longer string (`print("next: get_lab_timeline")`) or in a comment matches neither.
+# Three shapes count: the name as a whole string literal (`_run_tool("get_note", ...)`,
+# `{"name": "get_note"}`), the name in call position (`tools.get_note(...)`), or the name as the
+# first argument of a helper script the agent wrote (`python3 call_mimic.py list_notes
+# subject_id=...`). A name inside a longer string (`print("next: get_lab_timeline")`) or in a
+# comment matches none of them.
 _BASH_TOOL_REF = re.compile(
-    r"""["'](get_\w+|list_\w+|search_notes|run_sql)["']|\b(get_\w+|list_\w+|search_notes|run_sql)\s*\("""
+    r"""["'](get_\w+|list_\w+|search_notes|run_sql)["']"""
+    r"""|\b(get_\w+|list_\w+|search_notes|run_sql)\s*\("""
+    r"""|\.py\s+(get_\w+|list_\w+|search_notes|run_sql)\b"""
 )
 # Scope ids the script passes, however it passes them: `subject_id=1`, `"subject_id": 1`,
 # `subject_id = 1`, `WHERE subject_id = 1`. Only ids that are plausibly arguments (an
@@ -276,7 +280,7 @@ def parse_bash_script(command: str, step_id: int | None) -> list[Observation]:
     (subject_id / hadm_id / stay_id) so the retrieval metric can check patient scope, and run_sql
     carries each recoverable SQL literal as ``query``."""
     out: list[Observation] = []
-    names = {m.group(1) or m.group(2) for m in _BASH_TOOL_REF.finditer(command or "")} & MIMIC_TOOLS
+    names = {m.group(1) or m.group(2) or m.group(3) for m in _BASH_TOOL_REF.finditer(command or "")} & MIMIC_TOOLS
     if not names:
         return out
     args: dict = {}
@@ -512,7 +516,14 @@ def load_trajectory(path) -> Trajectory:
 
         # bash code-mode (mini-swe-agent): MIMIC calls live inside the bash command's script and
         # the rows come back as the command's stdout. Credit the referenced tools only when the
-        # command succeeded and printed something; pool that stdout as evidence.
+        # command succeeded and printed something. EVERY successful command's stdout is pooled as
+        # evidence, not only the steps that name a tool: these agents save tool output to files
+        # and read it back in later steps (`cat out.json`, `python3 helper.py ...`), and the pool
+        # is defined as what the agent saw. Measured on the harness-ablation arm, all 28 record ids
+        # flagged as fabricated under tool-step-only pooling were in the stdout of such steps. The
+        # exec-scaffold path pools every exec/wait output for the same reason. The cost is that an
+        # id the agent itself echoes (`echo "subject_id=..."`) counts as seen; that is a case id
+        # from the instruction in practice, and the exec path already accepts the same.
         bash_calls = {
             tc.get("tool_call_id"): tc
             for tc in s.get("tool_calls", [])
@@ -531,12 +542,10 @@ def load_trajectory(path) -> Trajectory:
                 if rc not in (0, None) or not text.strip():
                     continue
                 cmd = (tc.get("arguments") or {}).get("command", "") or ""
-                bash_obs = parse_bash_script(cmd, s.get("step_id"))
-                observations.extend(bash_obs)
-                if bash_obs:
-                    observations.append(
-                        Observation(step_id=s.get("step_id"), tool=EXEC_OUTPUT_TOOL, args={}, text=text)
-                    )
+                observations.extend(parse_bash_script(cmd, s.get("step_id")))
+                observations.append(
+                    Observation(step_id=s.get("step_id"), tool=EXEC_OUTPUT_TOOL, args={}, text=text)
+                )
 
         for item in (s.get("observation", {}) or {}).get("results", []) or []:
             tc = calls.get(item.get("source_call_id"))
