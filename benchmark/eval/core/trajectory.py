@@ -283,11 +283,14 @@ def parse_bash_script(command: str, step_id: int | None) -> list[Observation]:
     names = {m.group(1) or m.group(2) or m.group(3) for m in _BASH_TOOL_REF.finditer(command or "")} & MIMIC_TOOLS
     if not names:
         return out
+    # Scope ids are command-wide, so they are attached only when the command names exactly one
+    # value for a key. A script that reads two patients leaves subject_id unset (the calls count
+    # as unscoped) rather than tagging a valid read with the other patient's id and losing it.
     args: dict = {}
     for k, rx in _SCOPE_ARG.items():
         ids = sorted({m.group(1) for m in rx.finditer(command)})
-        if ids:
-            args[k] = ids[0] if len(ids) == 1 else ids
+        if len(ids) == 1:
+            args[k] = ids[0]
     for name in sorted(names):
         if name == "run_sql":
             queries = _sql_literals(command)

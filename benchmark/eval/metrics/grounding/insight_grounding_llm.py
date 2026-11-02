@@ -75,7 +75,8 @@ from clinicare_core.paths import bootstrap
 HERE = Path(__file__).resolve().parent
 
 bootstrap(__file__, "eval", "grounding")
-from core.trajectory import case_scope, load_trajectory  # noqa: E402
+from core.trajectory import EXEC_OUTPUT_TOOL, MIMIC_TOOLS, case_scope, load_trajectory  # noqa: E402
+from evidence_retrieval_recall import TOOL_TABLES, canon  # noqa: E402  (table-name citations)
 from insight_grounding import evidence_observations, evidence_pool  # noqa: E402  (T1 shares the loader)
 
 ROOT = HERE.parents[3]  # repo root (grounding → metrics → eval → benchmark → root)
@@ -206,6 +207,27 @@ def extract_claims_cited(client, model: str, report: str) -> list[dict]:
 # A date handle resolves on its calendar day: the report may write "2180-01-30 15:27" where
 # the row says "2180-01-30 15:27:00", so matching the full string would miss its own source.
 _DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}")
+# Every physical table a tool reads, canonicalised the way the gold names them, so a citation
+# like `labevents` resolves to get_lab_timeline rows and `radiology` to get_imaging_studies.
+_TABLE_NAMES = {t for tables in TOOL_TABLES.values() for t in canon(tables)} | set(canon(TOOL_TABLES.keys() and []))
+
+
+def _has_token(text: str, key: str) -> bool:
+    """`key` as a complete identifier in `text`: 12014968-RR-9 must not match 12014968-RR-99,
+    nor 10001217 match 10001217-107's prefix. Identifier characters are [A-Za-z0-9_-]."""
+    return re.search(r"(?<![A-Za-z0-9_-])" + re.escape(key) + r"(?![A-Za-z0-9_-])", text) is not None
+
+
+def _has_day(text: str, day: str) -> bool:
+    """`day` (YYYY-MM-DD) as a whole date in `text`; a following time of day is fine."""
+    return re.search(r"(?<!\d)" + re.escape(day) + r"(?!\d)", text) is not None
+
+
+def _tool_tables(obs) -> set[str]:
+    if obs.tool == "run_sql":
+        q = str((obs.args or {}).get("query") or (obs.args or {}).get("sql") or "").lower()
+        return {t for t in _TABLE_NAMES if re.search(r"\b" + re.escape(t) + r"\b", q)}
+    return canon(TOOL_TABLES.get(obs.tool, []))
 
 
 def resolve_citations(
@@ -213,32 +235,51 @@ def resolve_citations(
 ) -> tuple[list[int], list[str], list[str]]:
     """(indices of observations the handles resolve to, handles used, handles dropped).
 
-    A handle is dropped when it is one of the case's own ids (the task's subject_id / hadm_id /
-    stay_id): every retrieved row carries those, so they do not point at a source. A tool or
-    table name resolves to the observations produced by that tool. Anything else resolves to
-    the observations whose text or arguments contain it (a date handle by its calendar day)."""
+    Handle kinds, in order of recognition: a MIMIC tool name resolves to that tool's
+    observations; a table name resolves to the observations of tools that read it (run_sql by
+    the tables in its query); a date resolves to observations carrying that calendar day; any
+    other handle is a record identifier and must occur as a complete token in an observation's
+    text or arguments. A handle that is one of the case's own ids (the task's subject_id /
+    hadm_id / stay_id) is dropped: every retrieved row carries those, so it points at nothing.
+
+    Code-mode traces (bash, exec-scaffold) record a tool call with empty text and the rows in a
+    separate `_exec_output` observation. When a resolved call has no text, the exec outputs of
+    the same step are added, or every exec output when the step cannot be matched (async
+    exec cells return their rows in a later `wait` step)."""
     case_ids = set().union(*case.values()) if case else set()
     used, dropped, hits = [], [], set()
     for h in cited:
         hl = h.strip().strip("`*_[]()")
-        # The extractor sometimes returns the handle as it appeared, `stay_id: 31929757` or
-        # `note_id=12014968-RR-9`; the value is the handle.
         kv = re.match(r"^\s*[A-Za-z_]+\s*[:=]\s*(.+?)\s*$", hl)
         if kv:
             hl = kv.group(1).strip("`*_[]()\"'")
         if not hl or hl in case_ids:
             dropped.append(h)
             continue
-        key = _DATE_RX.match(hl).group(0) if _DATE_RX.match(hl) else hl
-        matched = False
-        for i, o in enumerate(observations):
-            tool = (o.tool or "").lower()
-            if hl.lower() == tool or hl.lower().replace("mimic_", "") == tool:
-                hits.add(i); matched = True
-                continue
-            if key in (o.text or "") or key in json.dumps(o.args, default=str):
-                hits.add(i); matched = True
-        (used if matched else dropped).append(h)
+        low = hl.lower()
+        tool = low[len("mimic_"):] if low.startswith("mimic_") else low
+        found: set[int] = set()
+        if tool in MIMIC_TOOLS:
+            found = {i for i, o in enumerate(observations) if o.tool == tool}
+        elif low in _TABLE_NAMES or (canon({low}) & _TABLE_NAMES):
+            want = canon({low}) or {low}
+            found = {i for i, o in enumerate(observations) if _tool_tables(o) & want}
+        elif _DATE_RX.match(hl):
+            day = _DATE_RX.match(hl).group(0)
+            found = {i for i, o in enumerate(observations)
+                     if _has_day(o.text or "", day) or _has_day(json.dumps(o.args, default=str), day)}
+        else:
+            found = {i for i, o in enumerate(observations)
+                     if _has_token(o.text or "", hl) or _has_token(json.dumps(o.args, default=str), hl)}
+        (used if found else dropped).append(h)
+        hits |= found
+    # Follow code-mode calls to their rows.
+    exec_idx = [i for i, o in enumerate(observations) if o.tool == EXEC_OUTPUT_TOOL]
+    for i in sorted(hits):
+        o = observations[i]
+        if o.tool != EXEC_OUTPUT_TOOL and not (o.text or "").strip():
+            same_step = [j for j in exec_idx if observations[j].step_id == o.step_id]
+            hits |= set(same_step or exec_idx)
     return sorted(hits), used, dropped
 
 
@@ -336,7 +377,7 @@ def judge_claims(client, model: str, claims: list[str], evidence: str) -> list[d
     return [b or {"verdict": "unverifiable", "reason": "ungraded (judge omitted)"} for b in best]
 
 
-def score(claims: list[str], verdicts: list[dict]) -> dict:
+def score(claims: list[str], verdicts: list[dict], mode: str = "pool") -> dict:
     """grounding = supported / n_claims. Extraction restricts to *checkable record facts*, so
     a claim the retrieved evidence doesn't support is ungrounded regardless of whether it's
     actively wrong (contradicted) or simply absent (unverifiable) — both count against. The
@@ -349,8 +390,11 @@ def score(claims: list[str], verdicts: list[dict]) -> dict:
         detail.append({"claim": c, **v} if isinstance(c, str) else {**c, **v})
     grounding = counts["supported"] / len(claims) if claims else None
     out = {"grounding": grounding, "n_claims": len(claims), **counts, "detail": detail}
-    # cited mode adds two verdicts; expose the derived rates whenever either appears.
-    if "unresolvable" in counts or "unresolved" in counts:
+    # cited mode: the two extra verdict kinds and the derived rates, always (a fully cited
+    # report has resolvable_frac 1.0, not a missing field).
+    if mode == "cited" or "unresolvable" in counts or "unresolved" in counts:
+        counts.setdefault("unresolvable", 0); counts.setdefault("unresolved", 0)
+        out.update({k: counts[k] for k in ("unresolvable", "unresolved")})
         n_res = len(claims) - counts.get("unresolvable", 0)
         out["resolvable_frac"] = n_res / len(claims) if claims else None
         out["strict_on_resolvable"] = counts["supported"] / n_res if n_res else None
@@ -394,7 +438,7 @@ SCORER_VERSION = 2
 # Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
 # judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
 # the cache; the version is part of the cited cache key.
-RESOLVER_VERSION = 1
+RESOLVER_VERSION = 2
 
 
 def _sha(*parts: str) -> str:
@@ -405,7 +449,8 @@ def _sha(*parts: str) -> str:
     return h.hexdigest()[:16]
 
 
-def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mode: str = "pool") -> dict:
+def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mode: str = "pool",
+               structure: str = "") -> dict:
     """The identity of THIS grading: scorer version, judge model, and a hash of the exact inputs.
 
     Stamped into every payload and re-checked before a cache hit. Without it, `--judge-model` or an
@@ -442,7 +487,11 @@ def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mod
         "inputs_sha256": _sha(report, pool),
         # Which evidence each claim is judged against (see module doc). Omitted for pool mode so
         # every cache written before the mode existed stays valid — pool mode IS that behaviour.
-        **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION} if mode != "pool" else {}),
+        # Cited mode resolves citations through each observation's tool, step and arguments and
+        # the case ids, none of which the flattened pool text captures; `structure` is their
+        # serialisation (see cited_structure), so a corrected trace re-grades.
+        **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION, "structure_sha": _sha(structure)}
+           if mode != "pool" else {}),
     }
 
 
@@ -493,6 +542,16 @@ def load_cited_inputs(tj: Path) -> tuple[list, dict]:
     return obs, case_scope(load_trajectory(tj).steps)
 
 
+def cited_structure(observations: list, case: dict) -> str:
+    """What the resolver sees besides the row text: per observation (step, tool, args), plus
+    the case ids. Part of the cited cache key."""
+    return json.dumps(
+        [[o.step_id, o.tool, o.args] for o in observations]
+        + [{k: sorted(v) for k, v in sorted(case.items())}],
+        default=str, sort_keys=True,
+    )
+
+
 def grade_one(report: str, pool: str, env: dict, model: str, expect: dict,
               mode: str = "pool", observations: list | None = None, case: dict | None = None) -> dict:
     """Score ONE trial from already-loaded inputs. Errors come back IN BAND rather than raising:
@@ -506,7 +565,7 @@ def grade_one(report: str, pool: str, env: dict, model: str, expect: dict,
         if mode == "cited":
             claims = extract_claims_cited(client, model, report)
             verdicts = judge_cited(client, model, claims, observations or [], case or {})
-            return {**expect, **score(claims, verdicts)}
+            return {**expect, **score(claims, verdicts, mode)}
         claims = extract_claims(client, model, report)
         verdicts = judge_claims(client, model, claims, pool)
         # Pool mode judges every claim against everything retrieved; say so per claim.
@@ -570,11 +629,15 @@ def main() -> int:
             noreport.append(tj)
             continue
         report, pool = loaded
-        expect = inputs_key(report, pool, model, env.get("JUDGE_BASE_URL", ""), mode)
+        obs, case, structure = None, None, ""
+        if mode == "cited":
+            obs, case = load_cited_inputs(tj)
+            structure = cited_structure(obs, case)
+        expect = inputs_key(report, pool, model, env.get("JUDGE_BASE_URL", ""), mode, structure)
         if cached_ok(tj.parents[1] / "verifier" / cname, expect) and not args.force:
             cached.append(tj)
         else:
-            todo.append((tj, report, pool, expect))
+            todo.append((tj, report, pool, expect, obs, case))
     for tj in noreport:
         print(f"  ! {tj.parts[-3]}: no verifier/report.md", file=sys.stderr)
 
@@ -612,10 +675,10 @@ def main() -> int:
 
     if todo:
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-            futs = {}
-            for tj, report, pool, expect in todo:
-                obs, case = load_cited_inputs(tj) if mode == "cited" else (None, None)
-                futs[ex.submit(grade_one, report, pool, env, model, expect, mode, obs, case)] = tj
+            futs = {
+                ex.submit(grade_one, report, pool, env, model, expect, mode, obs, case): tj
+                for tj, report, pool, expect, obs, case in todo
+            }
             for n, f in enumerate(as_completed(futs), 1):
                 tj = futs[f]
                 s = f.result()

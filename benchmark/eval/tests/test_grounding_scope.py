@@ -129,6 +129,10 @@ tools = [o.tool for o in t.observations]
 check("list_icu_stays recovered twice (ok + elided), not from the failed step", tools.count("list_icu_stays") == 2, str(tools))
 check("a tool only mentioned in a print string is not a call", "get_lab_timeline" not in tools, str(tools))
 check("scope ids carried in args", any(o.tool == "list_icu_stays" and o.args.get("subject_id") == "12014968" for o in t.observations))
+from core.trajectory import parse_bash_script
+two = parse_bash_script('x = _run_tool("get_lab_timeline", {"subject_id": 12014968}); y = _run_tool("get_note", {"subject_id": 99999999})', 9)
+check("a command naming two patients leaves subject_id unset (unscoped), not wrong-patient",
+      all("subject_id" not in o.args for o in two) and len(two) == 2, str([(o.tool, o.args) for o in two]))
 check("tool name as a helper-script argument is a call", "list_notes" in tools, str(tools))
 pooled = [o for o in t.observations if o.tool == EXEC_OUTPUT_TOOL]
 check("stdout pooled once per successful step, incl. steps that name no tool", len(pooled) == 4, str(len(pooled)))

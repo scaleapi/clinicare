@@ -110,7 +110,30 @@ v = IG.judge_cited(None, "m", [{"claim": "Creatinine value 2.3", "cited": ["get_
 check("correct citation supported; wrong-tool citation unverifiable",
       [x["verdict"] for x in v] == ["supported", "unverifiable"], str([x["verdict"] for x in v]))
 
+print("6b. identifiers match as complete tokens; table names resolve through the tool map")
+OBS2 = OBS + [Observation(step_id=5, tool="get_note", args={"note_id": "12014968-RR-99"},
+                          text='{"note_id": "12014968-RR-99", "text": "value 2.3 appears here too"}')]
+idx, used, dropped = IG.resolve_citations(["12014968-RR-9"], OBS2, CASE)
+check("RR-9 does not select RR-99", idx == [1], str(idx))
+idx, used, dropped = IG.resolve_citations(["labevents"], OBS2, CASE)
+check("table name → the tool that reads it", idx == [0], str(idx))
+idx, used, dropped = IG.resolve_citations(["radiology"], OBS2, CASE)
+check("radiology → the note reads (get_note serves radiology notes too)", idx == [1, 3], str(idx))
+idx, used, dropped = IG.resolve_citations(["microbiologyevents"], OBS2, CASE)
+check("a table no call read → unresolved", idx == [] and dropped == ["microbiologyevents"], str((idx, dropped)))
+
+print("6c. code-mode traces: a tool citation follows the call to its rows")
+OBS3 = [Observation(step_id=7, tool="get_lab_timeline", args={"subject_id": "12014968"}, text=""),
+        Observation(step_id=7, tool="_exec_output", args={}, text='{"label": "Creatinine", "value 2.3": 1}'),
+        Observation(step_id=8, tool="_exec_output", args={}, text='unrelated later output')]
+idx, used, dropped = IG.resolve_citations(["get_lab_timeline"], OBS3, CASE)
+check("empty-text call pulls in the same step's exec output only", idx == [0, 1], str(idx))
+v = IG.judge_cited(None, "m", [{"claim": "Creatinine value 2.3", "cited": ["get_lab_timeline"]}], OBS3, CASE)
+check("and the claim is judged supported against those rows", v[0]["verdict"] == "supported", str(v))
+
 print("7. score() derived rates in cited mode")
+sc = IG.score([{"claim": "a", "cited": ["x"]}], [{"verdict": "supported"}], mode="cited")
+check("fully cited report still reports resolvable_frac 1.0", sc.get("resolvable_frac") == 1.0 and sc.get("strict_on_resolvable") == 1.0, str(sc))
 sc = IG.score([{"claim": "a", "cited": []}, {"claim": "b", "cited": ["x"]}, {"claim": "c", "cited": ["y"]}, {"claim": "d", "cited": ["z"]}],
               [{"verdict": "unresolvable"}, {"verdict": "unresolved"}, {"verdict": "supported"}, {"verdict": "contradicted"}])
 check("strict grounding counts both failures", sc["grounding"] == 0.25, str(sc["grounding"]))
@@ -120,7 +143,9 @@ check("detail keeps the citation handles", sc["detail"][1]["cited"] == ["x"], st
 
 print("8. cache identity differs by mode")
 k_pool = IG.inputs_key("r", "p", "m", "u")
-k_cit = IG.inputs_key("r", "p", "m", "u", mode="cited")
+k_cit = IG.inputs_key("r", "p", "m", "u", mode="cited", structure="s1")
+k_cit2 = IG.inputs_key("r", "p", "m", "u", mode="cited", structure="s2")
+check("cited key changes when the observation structure changes", k_cit["structure_sha"] != k_cit2["structure_sha"])
 check("pool key unchanged shape (no evidence_mode)", "evidence_mode" not in k_pool)
 check("cited key tagged and uses the cited prompt", k_cit["evidence_mode"] == "cited" and k_cit["prompts_sha"] != k_pool["prompts_sha"])
 check("cache file names differ", IG.cache_name("pool") != IG.cache_name("cited"))
