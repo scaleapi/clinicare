@@ -76,7 +76,7 @@ HERE = Path(__file__).resolve().parent
 
 bootstrap(__file__, "eval", "grounding")
 from core.trajectory import EXEC_OUTPUT_TOOL, MIMIC_TOOLS, case_scope, load_trajectory  # noqa: E402
-from evidence_retrieval_recall import TOOL_TABLES, canon  # noqa: E402  (table-name citations)
+from evidence_retrieval_recall import _FROM_RX, TOOL_TABLES, canon  # noqa: E402  (table-name citations)
 from insight_grounding import evidence_observations, evidence_pool  # noqa: E402  (T1 shares the loader)
 
 ROOT = HERE.parents[3]  # repo root (grounding → metrics → eval → benchmark → root)
@@ -224,9 +224,11 @@ def _has_day(text: str, day: str) -> bool:
 
 
 def _tool_tables(obs) -> set[str]:
+    """Canonical table names an observation read. run_sql: the FROM/JOIN names in its query,
+    canonicalised the same way the gold is (so `discharge_notes` in the SQL becomes `discharge`)."""
     if obs.tool == "run_sql":
-        q = str((obs.args or {}).get("query") or (obs.args or {}).get("sql") or "").lower()
-        return {t for t in _TABLE_NAMES if re.search(r"\b" + re.escape(t) + r"\b", q)}
+        q = str((obs.args or {}).get("query") or (obs.args or {}).get("sql") or "")
+        return canon({m.group(1).lower() for m in _FROM_RX.finditer(q)})
     return canon(TOOL_TABLES.get(obs.tool, []))
 
 
@@ -264,6 +266,9 @@ def resolve_citations(
         elif low in _TABLE_NAMES or (canon({low}) & _TABLE_NAMES):
             want = canon({low}) or {low}
             found = {i for i, o in enumerate(observations) if _tool_tables(o) & want}
+            if not found:  # a table name the trace never read as a table: try it as plain text
+                found = {i for i, o in enumerate(observations)
+                         if _has_token(o.text or "", hl) or _has_token(json.dumps(o.args, default=str), hl)}
         elif _DATE_RX.match(hl):
             day = _DATE_RX.match(hl).group(0)
             found = {i for i, o in enumerate(observations)
@@ -438,7 +443,7 @@ SCORER_VERSION = 2
 # Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
 # judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
 # the cache; the version is part of the cited cache key.
-RESOLVER_VERSION = 2
+RESOLVER_VERSION = 3
 
 
 def _sha(*parts: str) -> str:

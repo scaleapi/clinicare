@@ -7,8 +7,10 @@ the picture? — is answerable on a few hundred reports. The sample is stratifie
 (the axis Fig. 6 is about), and within a family spread evenly over models and scenarios.
 
 Eligibility matches the paper's grounding-scoreable definition: a report is present, the agent
-retrieved at least one patient record (non-empty MIMIC observation), and the report does not
-declare the environment degraded.
+retrieved at least one patient record, and the report does not declare the environment degraded.
+"Retrieved a patient record" means a MIMIC data tool returned rows; in code-mode traces (exec
+scaffold, bash) it means a recovered MIMIC call plus non-empty command output, since the rows live
+in the output. Sub-agent summaries and command output with no MIMIC call do not qualify.
 
   python benchmark/eval/metrics/grounding/sample_reports.py \\
       --traces <dir with full750-clinicare-* arms> --per-family 50 --seed 20261102 \\
@@ -30,7 +32,7 @@ from clinicare_core.paths import bootstrap
 
 bootstrap(__file__, "eval")
 from core.scenarios import slug_from_trial_dir  # noqa: E402
-from core.trajectory import load_trajectory  # noqa: E402
+from core.trajectory import EXEC_OUTPUT_TOOL, MIMIC_TOOLS, load_trajectory  # noqa: E402
 
 # Harness family from the arm name (run_sweep.py tags): the harness is the first token after
 # the cohort prefix. `claude` is Claude Code, `codex` is Codex, `gemini` is Gemini CLI,
@@ -62,7 +64,12 @@ def scoreable(trial: Path) -> bool:
     if "Environment: degraded" in report.read_text(errors="replace"):
         return False
     traj = load_trajectory(tj)
-    return any(o.text.strip() for o in traj.observations)
+    obs = traj.observations
+    if any(o.tool in MIMIC_TOOLS and o.text.strip() for o in obs):
+        return True
+    return any(o.tool in MIMIC_TOOLS for o in obs) and any(
+        o.tool == EXEC_OUTPUT_TOOL and o.text.strip() for o in obs
+    )
 
 
 def main() -> int:

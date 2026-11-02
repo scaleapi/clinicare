@@ -119,6 +119,10 @@ idx, used, dropped = IG.resolve_citations(["labevents"], OBS2, CASE)
 check("table name → the tool that reads it", idx == [0], str(idx))
 idx, used, dropped = IG.resolve_citations(["radiology"], OBS2, CASE)
 check("radiology → the note reads (get_note serves radiology notes too)", idx == [1, 3], str(idx))
+OBS_SQL = OBS2 + [Observation(step_id=6, tool="run_sql", args={"query": "SELECT text FROM discharge_notes WHERE subject_id = 12014968"},
+                              text='[{"note_id": "12014968-DS-21", "text": "value DS"}]')]
+idx, used, dropped = IG.resolve_citations(["discharge_notes"], OBS_SQL, CASE)
+check("SQL table citation resolves through FROM/JOIN + canon (discharge_notes → discharge)", 4 in idx and 1 in idx, str(idx))
 idx, used, dropped = IG.resolve_citations(["microbiologyevents"], OBS2, CASE)
 check("a table no call read → unresolved", idx == [] and dropped == ["microbiologyevents"], str((idx, dropped)))
 
