@@ -39,10 +39,19 @@ FAMILY = {"claude": "claude-code", "codex": "codex", "gemini": "gemini-cli", "op
           "qwen": "qwen-coder", "miniswe": "mini-swe-agent"}
 
 
-def family_of(run: str) -> str | None:
+# Arms that are not among the paper's 16 systems: the MedHELM additions and the Nemotron run
+# postdate the submission, and the harness-* arms are the fixed-model ablation.
+NOT_IN_PAPER = ("gpt6astra", "gemini-38flash", "nemotronlightning")
+
+
+def family_of(run: str, cohort: str = "full750") -> str | None:
     parts = run.split("-")
-    # full750-clinicare-<harness>-<model>-v3 / harness-clinicare-<harness>-<model>-v3
-    return FAMILY.get(parts[2]) if len(parts) > 3 and parts[1] == "clinicare" else None
+    # <cohort>-clinicare-<harness>-<model>-v3
+    if len(parts) < 4 or parts[0] != cohort or parts[1] != "clinicare":
+        return None
+    if any(x in run for x in NOT_IN_PAPER):
+        return None
+    return FAMILY.get(parts[2])
 
 
 def scoreable(trial: Path) -> bool:
@@ -62,6 +71,7 @@ def main() -> int:
     ap.add_argument("--per-family", type=int, default=50)
     ap.add_argument("--families", default="claude-code,codex,gemini-cli,opencode")
     ap.add_argument("--seed", type=int, default=20261102)
+    ap.add_argument("--cohort", default="full750", help="arm-name prefix to sample from (default: the paper's full750 arms)")
     ap.add_argument("--out-list", type=Path, required=True)
     ap.add_argument("--out-csv", type=Path, required=True)
     args = ap.parse_args()
@@ -71,7 +81,7 @@ def main() -> int:
     # family -> model(run) -> scenario -> [trial dirs], eligibility checked lazily per pick.
     pool: dict[str, dict[str, dict[str, list[Path]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for run_dir in sorted(p for p in args.traces.iterdir() if p.is_dir()):
-        fam = family_of(run_dir.name)
+        fam = family_of(run_dir.name, args.cohort)
         if fam not in want:
             continue
         for trial in sorted(p for p in run_dir.iterdir() if p.is_dir()):
