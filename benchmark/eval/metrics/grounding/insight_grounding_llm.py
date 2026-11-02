@@ -29,6 +29,29 @@ Two LLM calls per report: (1) extract atomic claims, (2) judge them against the 
 the repo-root .env (JUDGE_BASE_URL / JUDGE_API_KEY);
 JUDGE_MODEL / --model overrides the default.
 
+WHAT EACH CLAIM IS JUDGED AGAINST — two modes, `--evidence pool|cited`:
+
+  pool  (default; the published numbers): every claim is judged against the WHOLE evidence pool
+        the agent retrieved in the run. A claim is supported when the fact appears anywhere in
+        what the agent saw, with the right entity/time attribution. This measures retrieved-
+        evidence support (faithfulness to the retrieved record): it catches fabrication and
+        over-extrapolation, but NOT a correct fact hung on the wrong citation — a claim whose
+        citation points at the wrong record still passes if another retrieved row has the fact.
+        Reports carry no structured claim→citation markup, which is why this was the metric.
+  cited : claim–citation pairs. Extraction also returns, per claim, the citation handles the
+        report attaches to it (record / note / order ids, timestamps, tool or table names); the
+        resolver maps each handle to the retrieved observations that contain it, and the judge
+        sees ONLY those rows. A claim with no handle (beyond the case's own subject_id/hadm_id,
+        which every row carries) is `unresolvable` (no citation); one whose handles match no
+        retrieved row is `unresolved` (the citation points at nothing the agent retrieved). Both
+        count against the strict score. Per claim, `evidence_refs` records exactly which
+        observations the judge saw, in both modes.
+
+  grounding (pool)  = supported / n_claims
+  grounding (cited) = supported / n_claims          (strict: unresolvable + unresolved count against)
+  strict_on_resolvable = supported / n_resolvable    (precision of the citations that exist)
+  resolvable_frac   = n_resolvable / n_claims        (how often the report gives a usable citation)
+
   cd <repo root>
   python benchmark/eval/metrics/grounding/insight_grounding_llm.py \
       --traces benchmark/eval/traces --limit 3 --verbose
@@ -52,7 +75,8 @@ from clinicare_core.paths import bootstrap
 HERE = Path(__file__).resolve().parent
 
 bootstrap(__file__, "eval", "grounding")
-from insight_grounding import evidence_pool  # noqa: E402  (T1 shares the trace→pool loader)
+from core.trajectory import case_scope, load_trajectory  # noqa: E402
+from insight_grounding import evidence_observations, evidence_pool  # noqa: E402  (T1 shares the loader)
 
 ROOT = HERE.parents[3]  # repo root (grounding → metrics → eval → benchmark → root)
 # Sized for a ~128k-token window (~500k chars), leaving headroom for the prompt + claims.
@@ -135,6 +159,87 @@ def extract_claims(client, model: str, report: str) -> list[str]:
     raw = _call(client, model, _EXTRACT_PROMPT.format(report=report))
     claims = [c.strip() for c in _json_array(raw) if isinstance(c, str) and c.strip()]
     return claims
+
+
+_EXTRACT_CITED_PROMPT = """You are extracting atomic factual claims, WITH THEIR CITATIONS, from a \
+clinical decision report for grounding verification.
+
+Extract every claim that asserts a SPECIFIC, checkable clinical or quantitative fact drawn \
+from the patient's record: lab/vital values, medication names & doses, imaging/procedure \
+findings, counts, dates of events, and presence/absence of a clinical event or order.
+
+For EACH claim also copy, VERBATIM from the report, every citation handle the report attaches \
+to that claim — the record identifiers (note ids like 12014968-RR-9, order/poe ids like \
+10001217-107, stay_id / hadm_id values), the timestamps or dates the claim is pinned to \
+(e.g. 2180-01-30 15:27:00), and the tool or table named as the source (e.g. get_imaging_studies, \
+labevents). A handle belongs to a claim when the report places it in the same sentence, table \
+row, bullet, or bracketed citation as the fact. Do NOT invent handles; if the report gives none \
+for a claim, return an empty list.
+
+Rules:
+- One atomic claim per item — split compound sentences.
+- Keep the entity/context that makes it checkable (which patient/stay, what time, what test).
+- EXCLUDE: the final verdict, restatements of the task criteria, methodology/reasoning \
+sentences, and claims whose only content is a record ID (those are checked separately).
+- Do NOT invent claims; only extract what the report states.
+
+Return ONLY a JSON array of objects, e.g.
+[{{"claim": "Serum creatinine peaked at 2.3 mg/dL on 2180-09-20", "cited": ["2180-09-20", "get_lab_timeline"]}}, ...]
+
+REPORT:
+{report}
+"""
+
+
+def extract_claims_cited(client, model: str, report: str) -> list[dict]:
+    raw = _call(client, model, _EXTRACT_CITED_PROMPT.format(report=report))
+    out = []
+    for o in _json_array(raw):
+        if isinstance(o, dict) and isinstance(o.get("claim"), str) and o["claim"].strip():
+            cited = o.get("cited") or []
+            out.append({"claim": o["claim"].strip(), "cited": [str(c).strip() for c in cited if str(c).strip()]})
+        elif isinstance(o, str) and o.strip():
+            out.append({"claim": o.strip(), "cited": []})
+    return out
+
+
+# A date handle resolves on its calendar day: the report may write "2180-01-30 15:27" where
+# the row says "2180-01-30 15:27:00", so matching the full string would miss its own source.
+_DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def resolve_citations(
+    cited: list[str], observations: list, case: dict[str, set[str]]
+) -> tuple[list[int], list[str], list[str]]:
+    """(indices of observations the handles resolve to, handles used, handles dropped).
+
+    A handle is dropped when it is one of the case's own ids (the task's subject_id / hadm_id /
+    stay_id): every retrieved row carries those, so they do not point at a source. A tool or
+    table name resolves to the observations produced by that tool. Anything else resolves to
+    the observations whose text or arguments contain it (a date handle by its calendar day)."""
+    case_ids = set().union(*case.values()) if case else set()
+    used, dropped, hits = [], [], set()
+    for h in cited:
+        hl = h.strip().strip("`*_[]()")
+        # The extractor sometimes returns the handle as it appeared, `stay_id: 31929757` or
+        # `note_id=12014968-RR-9`; the value is the handle.
+        kv = re.match(r"^\s*[A-Za-z_]+\s*[:=]\s*(.+?)\s*$", hl)
+        if kv:
+            hl = kv.group(1).strip("`*_[]()\"'")
+        if not hl or hl in case_ids:
+            dropped.append(h)
+            continue
+        key = _DATE_RX.match(hl).group(0) if _DATE_RX.match(hl) else hl
+        matched = False
+        for i, o in enumerate(observations):
+            tool = (o.tool or "").lower()
+            if hl.lower() == tool or hl.lower().replace("mimic_", "") == tool:
+                hits.add(i); matched = True
+                continue
+            if key in (o.text or "") or key in json.dumps(o.args, default=str):
+                hits.add(i); matched = True
+        (used if matched else dropped).append(h)
+    return sorted(hits), used, dropped
 
 
 # ── (2) judge claims against retrieved evidence ────────────────────────────────────────────
@@ -241,16 +346,55 @@ def score(claims: list[str], verdicts: list[dict]) -> dict:
     for c, v in zip(claims, verdicts):
         verd = v.get("verdict", "unverifiable").lower()  # canonical case (defensive)
         counts[verd] = counts.get(verd, 0) + 1
-        detail.append({"claim": c, **v})
+        detail.append({"claim": c, **v} if isinstance(c, str) else {**c, **v})
     grounding = counts["supported"] / len(claims) if claims else None
-    return {"grounding": grounding, "n_claims": len(claims), **counts, "detail": detail}
+    out = {"grounding": grounding, "n_claims": len(claims), **counts, "detail": detail}
+    # cited mode adds two verdicts; expose the derived rates whenever either appears.
+    if "unresolvable" in counts or "unresolved" in counts:
+        n_res = len(claims) - counts.get("unresolvable", 0)
+        out["resolvable_frac"] = n_res / len(claims) if claims else None
+        out["strict_on_resolvable"] = counts["supported"] / n_res if n_res else None
+    return out
+
+
+def judge_cited(client, model: str, claims: list[dict], observations: list, case: dict) -> list[dict]:
+    """Cited mode: each claim is judged against ONLY the observations its citation handles
+    resolve to. Claims sharing the same resolved set are batched into one judge call. The
+    verdict records `evidence_refs` — the (step_id, tool) of every observation the judge saw."""
+    groups: dict[tuple[int, ...], list[int]] = {}
+    meta: list[dict] = []
+    for k, c in enumerate(claims):
+        idx, used, dropped = resolve_citations(c.get("cited", []), observations, case)
+        meta.append({"cited_used": used, "cited_dropped": dropped,
+                     "evidence_refs": [[observations[i].step_id, observations[i].tool] for i in idx]})
+        if not c.get("cited"):
+            meta[k]["verdict"] = "unresolvable"; meta[k]["reason"] = "no citation attached to the claim"
+        elif not idx:
+            meta[k]["verdict"] = "unresolved"; meta[k]["reason"] = "citation matches no retrieved record"
+        else:
+            groups.setdefault(tuple(idx), []).append(k)
+    for idx, ks in groups.items():
+        evidence = "\n".join(observations[i].text for i in idx if observations[i].text)
+        graded = judge_claims(client, model, [claims[k]["claim"] for k in ks], evidence)
+        for k, g in zip(ks, graded):
+            meta[k].update({"verdict": g.get("verdict", "unverifiable"), "reason": g.get("reason", "")})
+    return meta
 
 
 # Per-trial cache file, alongside process.json / policy_support.json. Named for this metric so the
 # two LLM grounding stages cannot clobber each other.
 CACHE_NAME = "insight_grounding_llm.json"
+CACHE_NAME_CITED = "insight_grounding_llm_cited.json"
+
+
+def cache_name(mode: str) -> str:
+    return CACHE_NAME_CITED if mode == "cited" else CACHE_NAME
 # Bump when the prompts or the scoring change; every cache written by an older version is stale.
 SCORER_VERSION = 2
+# Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
+# judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
+# the cache; the version is part of the cited cache key.
+RESOLVER_VERSION = 1
 
 
 def _sha(*parts: str) -> str:
@@ -261,7 +405,7 @@ def _sha(*parts: str) -> str:
     return h.hexdigest()[:16]
 
 
-def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "") -> dict:
+def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mode: str = "pool") -> dict:
     """The identity of THIS grading: scorer version, judge model, and a hash of the exact inputs.
 
     Stamped into every payload and re-checked before a cache hit. Without it, `--judge-model` or an
@@ -292,8 +436,13 @@ def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "") -> 
         # The prompts themselves, hashed automatically. Previously these were covered only by a
         # MANUAL SCORER_VERSION bump — edit a prompt, forget to bump, and every cache stays valid
         # against changed grading logic. That is a likelier mistake than any of the above.
-        "prompts_sha": _sha(_EXTRACT_PROMPT, _JUDGE_PROMPT),
+        "prompts_sha": _sha(_EXTRACT_PROMPT, _JUDGE_PROMPT)
+        if mode == "pool"
+        else _sha(_EXTRACT_CITED_PROMPT, _JUDGE_PROMPT),
         "inputs_sha256": _sha(report, pool),
+        # Which evidence each claim is judged against (see module doc). Omitted for pool mode so
+        # every cache written before the mode existed stays valid — pool mode IS that behaviour.
+        **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION} if mode != "pool" else {}),
     }
 
 
@@ -338,7 +487,14 @@ def load_inputs(tj: Path) -> tuple[str, str] | None:
     return report.read_text(), pool
 
 
-def grade_one(report: str, pool: str, env: dict, model: str, expect: dict) -> dict:
+def load_cited_inputs(tj: Path) -> tuple[list, dict]:
+    """(observations, case scope) for cited mode — the per-call evidence and the task's own ids."""
+    obs, _, _ = evidence_observations(tj.parent)
+    return obs, case_scope(load_trajectory(tj).steps)
+
+
+def grade_one(report: str, pool: str, env: dict, model: str, expect: dict,
+              mode: str = "pool", observations: list | None = None, case: dict | None = None) -> dict:
     """Score ONE trial from already-loaded inputs. Errors come back IN BAND rather than raising:
     one bad trial must not kill the pool, and `cached_ok` uses the `error` key to force a retry.
 
@@ -347,8 +503,16 @@ def grade_one(report: str, pool: str, env: dict, model: str, expect: dict) -> di
     """
     try:
         client = make_client(env)
+        if mode == "cited":
+            claims = extract_claims_cited(client, model, report)
+            verdicts = judge_cited(client, model, claims, observations or [], case or {})
+            return {**expect, **score(claims, verdicts)}
         claims = extract_claims(client, model, report)
-        return {**expect, **score(claims, judge_claims(client, model, claims, pool))}
+        verdicts = judge_claims(client, model, claims, pool)
+        # Pool mode judges every claim against everything retrieved; say so per claim.
+        for v in verdicts:
+            v["evidence_refs"] = "all"
+        return {**expect, **score(claims, verdicts)}
     except Exception as exc:  # noqa: BLE001 - in-band so the pool survives
         return {**expect, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -368,7 +532,16 @@ def main() -> int:
     ap.add_argument(
         "--force", action="store_true", help=f"re-grade trials that already have {CACHE_NAME}"
     )
+    ap.add_argument(
+        "--evidence", choices=["pool", "cited"], default="pool",
+        help="pool: judge each claim against everything retrieved (published); "
+             "cited: judge each claim against the records its citation resolves to",
+    )
+    ap.add_argument("--trials-from", type=Path, default=None,
+                    help="only grade trial dirs listed (one path per line) in this file")
     args = ap.parse_args()
+    mode = args.evidence
+    cname = cache_name(mode)
 
     env = load_env()
     # Default matches every other judge call site, and is the model the published grounding
@@ -379,6 +552,9 @@ def main() -> int:
     model = model.split("/")[-1]
 
     trials = sorted(args.traces.glob("*/*/*/trajectory.json"))
+    if args.trials_from:
+        keep = {Path(l.strip()).resolve() for l in args.trials_from.read_text().splitlines() if l.strip()}
+        trials = [t for t in trials if t.parents[1].resolve() in keep]
     if args.limit:
         trials = trials[: args.limit]
     if not trials:
@@ -394,8 +570,8 @@ def main() -> int:
             noreport.append(tj)
             continue
         report, pool = loaded
-        expect = inputs_key(report, pool, model, env.get("JUDGE_BASE_URL", ""))
-        if cached_ok(tj.parents[1] / "verifier" / CACHE_NAME, expect) and not args.force:
+        expect = inputs_key(report, pool, model, env.get("JUDGE_BASE_URL", ""), mode)
+        if cached_ok(tj.parents[1] / "verifier" / cname, expect) and not args.force:
             cached.append(tj)
         else:
             todo.append((tj, report, pool, expect))
@@ -403,9 +579,10 @@ def main() -> int:
         print(f"  ! {tj.parts[-3]}: no verifier/report.md", file=sys.stderr)
 
     print(
-        f"judge model: {model}   trials: {len(trials)}   to grade: {len(todo)}   cached: {len(cached)}\n"
+        f"judge model: {model}   evidence: {mode}   trials: {len(trials)}   to grade: {len(todo)}   cached: {len(cached)}\n"
     )
-    print(f"{'run':30s} {'scenario':18s} {'grounded':>8s} {'sup':>4s} {'con':>4s} {'unv':>4s}")
+    extra = "" if mode == "pool" else f" {'nocit':>5s} {'unres':>5s} {'res%':>5s}"
+    print(f"{'run':30s} {'scenario':18s} {'grounded':>8s} {'sup':>4s} {'con':>4s} {'unv':>4s}{extra}")
     rows, rates, dump = [], [], []
 
     def record(tj: Path, s: dict, from_cache: bool) -> None:
@@ -415,9 +592,14 @@ def main() -> int:
             return
         g = f"{s['grounding']:.2f}" if s.get("grounding") is not None else "  -"
         tag = " (cached)" if from_cache else ""
+        extra = ""
+        if mode != "pool":
+            rf = s.get("resolvable_frac")
+            extra = (f" {s.get('unresolvable', 0):>5d} {s.get('unresolved', 0):>5d} "
+                     f"{(f'{rf:.2f}' if rf is not None else '-'):>5s}")
         print(
             f"  {run[:28]:28s} {slug:18s} {g:>8s} {s['supported']:>4d} "
-            f"{s['contradicted']:>4d} {s['unverifiable']:>4d}{tag}"
+            f"{s['contradicted']:>4d} {s['unverifiable']:>4d}{extra}{tag}"
         )
         if args.verbose:
             for d in s.get("detail", []):
@@ -430,16 +612,16 @@ def main() -> int:
 
     if todo:
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-            futs = {
-                ex.submit(grade_one, report, pool, env, model, expect): tj
-                for tj, report, pool, expect in todo
-            }
+            futs = {}
+            for tj, report, pool, expect in todo:
+                obs, case = load_cited_inputs(tj) if mode == "cited" else (None, None)
+                futs[ex.submit(grade_one, report, pool, env, model, expect, mode, obs, case)] = tj
             for n, f in enumerate(as_completed(futs), 1):
                 tj = futs[f]
                 s = f.result()
                 # Write the cache even on error: cached_ok() rejects it, so the next run retries,
                 # but the payload is on disk for diagnosis instead of only in a lost stdout.
-                (tj.parents[1] / "verifier" / CACHE_NAME).write_text(json.dumps(s, indent=2))
+                (tj.parents[1] / "verifier" / cname).write_text(json.dumps(s, indent=2))
                 record(tj, s, from_cache=False)
                 if n % 25 == 0:
                     print(f"    {n}/{len(todo)} graded", file=sys.stderr)
@@ -448,9 +630,9 @@ def main() -> int:
     # than only what it happened to grade this time.
     for tj in cached:
         try:
-            record(tj, json.loads((tj.parents[1] / "verifier" / CACHE_NAME).read_text()), True)
+            record(tj, json.loads((tj.parents[1] / "verifier" / cname).read_text()), True)
         except (OSError, ValueError):
-            print(f"  ! {tj.parts[-3]}: unreadable cached {CACHE_NAME}", file=sys.stderr)
+            print(f"  ! {tj.parts[-3]}: unreadable cached {cname}", file=sys.stderr)
 
     if rates:
         print(f"\nmean grounding over {len(rates)} trials: {sum(rates)/len(rates):.3f}")
