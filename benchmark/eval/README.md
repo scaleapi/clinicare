@@ -84,6 +84,8 @@ python $HCE/tests/test_verdict.py                            # primary-reward co
 python $HCE/tests/test_policy_grounding.py                   # deterministic policy tests
 python $HCE/tests/test_evidence.py                           # evidence extractor tests
 python $HCE/tests/test_paired_tests.py                       # paired-statistics tests
+python $HCE/tests/test_grounding_scope.py                    # R_retrieval scope + bash code-mode parsing
+python $HCE/tests/test_insight_grounding_cited.py            # which evidence reaches the P_claim judge
 ```
 
 Grounding metrics run over a directory of trace dumps — see **Grounding metrics** below.
@@ -98,7 +100,7 @@ and what they showed; this file is the runbook.
 | :-- | :-- | :-- |
 | `evidence_retrieval_recall` | did the agent read the source tables the answer requires? | committed gold, no LLM |
 | `insight_grounding` (T1) | are the record IDs it cited present in what it retrieved? | trace only, no gold, no LLM |
-| `insight_grounding_llm` (T2) | are its numeric / free-text claims supported by that evidence? | LLM judge |
+| `insight_grounding_llm` (T2) | are its numeric / free-text claims supported by that evidence (`--evidence pool`), or by the records they cite (`--evidence cited`)? | LLM judge |
 | `insights_recall` | did the report cover each required-evidence category? | committed rubric + LLM judge |
 
 T1 is a **fabrication floor**, not a discriminator: an ID cannot be computed, so an ID absent
@@ -142,14 +144,25 @@ G=benchmark/eval/metrics/grounding
 #    Requires your own copy: the delivery is a MIMIC derivative and is not publicly distributed.
 python benchmark/eval/gold/build_gold.py --annotation <your-copy.csv>
 
-# 3. evidence_retrieval_recall — reads the committed gold_sources.json, no LLM
-python $G/evidence_retrieval_recall.py --traces <traces>
+# 3. evidence_retrieval_recall — reads the committed gold_sources.json, no LLM.
+#    A required table is credited only when the call that read it named the case's patient
+#    (subject_id in the typed args or in the run_sql text); calls that name no subject_id are
+#    credited and counted `unscoped`; another encounter of the same patient is counted, not
+#    penalised. --no-scope reproduces the published numbers; --out writes per-trial JSON.
+python $G/evidence_retrieval_recall.py --traces <traces> [--no-scope] [--out rr.json]
 
 # 4. insight_grounding T1 — trace-only, no gold, no LLM
 python $G/insight_grounding.py --traces <traces>
 
 # 5. insight_grounding T2 — LLM judge (start with --limit to sanity-check cost)
 python $G/insight_grounding_llm.py --traces <traces> --limit 3 --verbose
+#    --evidence pool  (default) judges every claim against everything the agent retrieved —
+#                     retrieved-evidence support, the published P_claim; evidence_refs="all"
+#    --evidence cited judges each claim only against the records its citation resolves to
+#                     (claim–citation pairs); adds unresolvable / unresolved verdicts,
+#                     resolvable_frac and strict_on_resolvable; separate cache file
+#    --trials-from F  grade only the trial dirs listed in F (see sample_reports.py)
+python $G/insight_grounding_llm.py --traces <traces> --evidence cited --trials-from sample.txt
 
 # 6. (only if the annotation changes) rebuild the required-evidence rubric
 python benchmark/eval/gold/build_required_evidence.py --annotation <your-copy.csv>
