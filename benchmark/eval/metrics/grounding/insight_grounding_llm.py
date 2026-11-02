@@ -209,7 +209,7 @@ def extract_claims_cited(client, model: str, report: str) -> list[dict]:
 _DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 # Every physical table a tool reads, canonicalised the way the gold names them, so a citation
 # like `labevents` resolves to get_lab_timeline rows and `radiology` to get_imaging_studies.
-_TABLE_NAMES = {t for tables in TOOL_TABLES.values() for t in canon(tables)} | set(canon(TOOL_TABLES.keys() and []))
+_TABLE_NAMES = {t for tables in TOOL_TABLES.values() for t in canon(tables)}
 
 
 def _has_token(text: str, key: str) -> bool:
@@ -232,50 +232,118 @@ def _tool_tables(obs) -> set[str]:
     return canon(TOOL_TABLES.get(obs.tool, []))
 
 
+# Source-type words a report uses as a citation ("per the discharge summary", "EMAR", "POE"),
+# mapped to the canonical tables those sources live in. Matched as whole words, case-insensitive.
+_SOURCE_WORDS = {
+    "discharge summary": {"discharge"}, "discharge narrative": {"discharge"}, "discharge note": {"discharge"},
+    "discharge notes": {"discharge"}, "radiology report": {"radiology"}, "radiology note": {"radiology"},
+    "radiology notes": {"radiology"}, "radiology": {"radiology"}, "emar": {"emar"}, "mar": {"emar"},
+    "poe": {"poe"}, "orders": {"poe"}, "prescriptions": {"prescriptions"}, "pharmacy": {"pharmacy"},
+    "labevents": {"labevents"}, "lab timeline": {"labevents"}, "labs": {"labevents"},
+    "chartevents": {"chartevents"}, "vitals": {"chartevents", "vitalsign"}, "vital signs": {"chartevents", "vitalsign"},
+    "inputevents": {"inputevents"}, "outputevents": {"outputevents"}, "icustays": {"icustays"},
+    "icu stays": {"icustays"}, "admissions": {"admissions"}, "transfers": {"transfers"},
+    "microbiology": {"microbiologyevents"}, "medrecon": {"medrecon"}, "medication reconciliation": {"medrecon"},
+    "procedureevents": {"procedureevents"}, "diagnoses_icd": {"diagnoses_icd"}, "triage": {"triage"},
+    "edstays": {"edstays"}, "ed visit": {"edstays"},
+}
+_TOOL_IN_HANDLE = re.compile(r"(get_[a-z_]+|list_[a-z_]+|search_notes|run_sql)")
+_LONG_ID = re.compile(r"\d{6,}(?:-[A-Z]{1,4}-\d+|-\d+)?")           # 12014968, 12014968-RR-9, 10001217-107
+_SHORT_NOTE = re.compile(r"\b([A-Z]{1,4})-(\d+)\b")                    # RR-9 / DS-21 without the subject prefix
+_FULL_TS = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?")          # 2180-01-30 15:27
+_MD_TS = re.compile(r"(?<!\d)(\d{1,2})[-/](\d{1,2})[ T]+(\d{2}:\d{2})")   # 11-12 13:35, 5/3 10:55 (year elided)
+_TIME_ONLY = re.compile(r"(?<![\d:])(\d{2}:\d{2})(?![\d:])")            # 20:17 (a window the report itself set)
+
+
+def _handle_probes(hl: str) -> list[tuple[str, str]]:
+    """Decompose one citation handle into (kind, probe) pairs. A handle like
+    `mimic_get_lab_timeline lab_name="hemoglobin"` yields ('tool', 'get_lab_timeline');
+    `HADM 24440629` yields ('id', '24440629'); `11-12 13:35` yields ('md', '-11-12 13:35');
+    `discharge narrative` yields ('table', 'discharge'). Nothing recognised → []."""
+    probes: list[tuple[str, str]] = []
+    low = hl.lower()
+    m = _TOOL_IN_HANDLE.search(low)
+    if m and m.group(1) in MIMIC_TOOLS:
+        probes.append(("tool", m.group(1)))
+    for m in _LONG_ID.finditer(hl):
+        probes.append(("id", m.group(0)))
+    for m in _SHORT_NOTE.finditer(hl):
+        probes.append(("note", f"{m.group(1)}-{m.group(2)}"))
+    for m in _FULL_TS.finditer(hl):
+        probes.append(("ts", m.group(0)))
+    if not any(k == "ts" for k, _ in probes):
+        for m in _MD_TS.finditer(hl):
+            probes.append(("md", f"-{int(m.group(1)):02d}-{int(m.group(2)):02d} {m.group(3)}"))
+        if not any(k == "md" for k, _ in probes):
+            for m in _TIME_ONLY.finditer(hl):
+                probes.append(("time", m.group(1)))
+    for w, tables in _SOURCE_WORDS.items():
+        if re.search(r"(?<![a-z_])" + re.escape(w) + r"(?![a-z_])", low):
+            probes.extend(("table", t) for t in tables)
+    if canon({low}) & _TABLE_NAMES or low in _TABLE_NAMES:
+        probes.extend(("table", t) for t in (canon({low}) or {low}))
+    return probes
+
+
+def _probe_hits(kind: str, probe: str, observations: list) -> set[int]:
+    out: set[int] = set()
+    for i, o in enumerate(observations):
+        text = o.text or ""
+        argtxt = json.dumps(o.args, default=str)
+        if kind == "tool":
+            hit = o.tool == probe
+        elif kind == "table":
+            hit = probe in _tool_tables(o)
+        elif kind == "id":
+            hit = _has_token(text, probe) or _has_token(argtxt, probe)
+        elif kind == "note":
+            hit = re.search(r"\d{6,}-" + re.escape(probe) + r"(?![A-Za-z0-9_-])", text + " " + argtxt) is not None
+        elif kind == "ts":
+            day = probe[:10]
+            hit = _has_day(text, day) or _has_day(argtxt, day)
+        elif kind == "md":
+            hit = probe in text or probe in argtxt
+        elif kind == "time":
+            hit = re.search(r"\d{4}-\d{2}-\d{2}[ T]" + re.escape(probe), text) is not None
+        else:
+            hit = False
+        if hit:
+            out.add(i)
+    return out
+
+
 def resolve_citations(
     cited: list[str], observations: list, case: dict[str, set[str]]
 ) -> tuple[list[int], list[str], list[str]]:
     """(indices of observations the handles resolve to, handles used, handles dropped).
 
-    Handle kinds, in order of recognition: a MIMIC tool name resolves to that tool's
-    observations; a table name resolves to the observations of tools that read it (run_sql by
-    the tables in its query); a date resolves to observations carrying that calendar day; any
-    other handle is a record identifier and must occur as a complete token in an observation's
-    text or arguments. A handle that is one of the case's own ids (the task's subject_id /
-    hadm_id / stay_id) is dropped: every retrieved row carries those, so it points at nothing.
+    Each handle is decomposed into probes (see _handle_probes): tool names resolve to that tool's
+    observations; table names and source words ("discharge summary", "EMAR", "POE") to the
+    observations of tools that read those tables (run_sql by the tables in its query); record ids
+    must occur as complete tokens; a short note id (RR-9) matches with any subject prefix;
+    timestamps match on their calendar day, or on month-day-time / time-of-day when the report
+    elided the year. A handle that is one of the case's own ids (the task's subject_id / hadm_id /
+    stay_id) is dropped: every retrieved row carries those, so it points at nothing. A handle
+    with no recognisable probe (a value, a phrase) is not a citation and is dropped too.
 
     Code-mode traces (bash, exec-scaffold) record a tool call with empty text and the rows in a
     separate `_exec_output` observation. When a resolved call has no text, the exec outputs of
-    the same step are added, or every exec output when the step cannot be matched (async
-    exec cells return their rows in a later `wait` step)."""
+    the same step are added, or every exec output when the step cannot be matched (async exec
+    cells return their rows in a later `wait` step)."""
     case_ids = set().union(*case.values()) if case else set()
     used, dropped, hits = [], [], set()
     for h in cited:
         hl = h.strip().strip("`*_[]()")
         kv = re.match(r"^\s*[A-Za-z_]+\s*[:=]\s*(.+?)\s*$", hl)
-        if kv:
+        if kv and not _TOOL_IN_HANDLE.search(hl.lower()):
             hl = kv.group(1).strip("`*_[]()\"'")
-        if not hl or hl in case_ids:
+        probes = [(k, v) for k, v in _handle_probes(hl) if not (k == "id" and v in case_ids)]
+        if not hl or hl in case_ids or not probes:
             dropped.append(h)
             continue
-        low = hl.lower()
-        tool = low[len("mimic_"):] if low.startswith("mimic_") else low
         found: set[int] = set()
-        if tool in MIMIC_TOOLS:
-            found = {i for i, o in enumerate(observations) if o.tool == tool}
-        elif low in _TABLE_NAMES or (canon({low}) & _TABLE_NAMES):
-            want = canon({low}) or {low}
-            found = {i for i, o in enumerate(observations) if _tool_tables(o) & want}
-            if not found:  # a table name the trace never read as a table: try it as plain text
-                found = {i for i, o in enumerate(observations)
-                         if _has_token(o.text or "", hl) or _has_token(json.dumps(o.args, default=str), hl)}
-        elif _DATE_RX.match(hl):
-            day = _DATE_RX.match(hl).group(0)
-            found = {i for i, o in enumerate(observations)
-                     if _has_day(o.text or "", day) or _has_day(json.dumps(o.args, default=str), day)}
-        else:
-            found = {i for i, o in enumerate(observations)
-                     if _has_token(o.text or "", hl) or _has_token(json.dumps(o.args, default=str), hl)}
+        for k, v in probes:
+            found |= _probe_hits(k, v, observations)
         (used if found else dropped).append(h)
         hits |= found
     # Follow code-mode calls to their rows.
@@ -286,6 +354,25 @@ def resolve_citations(
             same_step = [j for j in exec_idx if observations[j].step_id == o.step_id]
             hits |= set(same_step or exec_idx)
     return sorted(hits), used, dropped
+
+
+def citation_kind(cited: list[str], case: dict[str, set[str]]) -> str:
+    """'none' when the claim carries no citation handle at all, 'descriptor' when every handle is
+    a case id or an unrecognisable phrase (a value, "the chart"), else 'pointer'. Only a pointer
+    that matches nothing retrieved is an `unresolved` citation; the other two are `unresolvable`."""
+    if not cited:
+        return "none"
+    case_ids = set().union(*case.values()) if case else set()
+    for h in cited:
+        hl = h.strip().strip("`*_[]()")
+        kv = re.match(r"^\s*[A-Za-z_]+\s*[:=]\s*(.+?)\s*$", hl)
+        if kv and not _TOOL_IN_HANDLE.search(hl.lower()):
+            hl = kv.group(1).strip("`*_[]()\"'")
+        if hl in case_ids:
+            continue
+        if any(not (k == "id" and v in case_ids) for k, v in _handle_probes(hl)):
+            return "pointer"
+    return "descriptor"
 
 
 # ── (2) judge claims against retrieved evidence ────────────────────────────────────────────
@@ -416,8 +503,12 @@ def judge_cited(client, model: str, claims: list[dict], observations: list, case
         idx, used, dropped = resolve_citations(c.get("cited", []), observations, case)
         meta.append({"cited_used": used, "cited_dropped": dropped,
                      "evidence_refs": [[observations[i].step_id, observations[i].tool] for i in idx]})
-        if not c.get("cited"):
+        kind = citation_kind(c.get("cited", []), case)
+        meta[k]["citation_kind"] = kind
+        if kind == "none":
             meta[k]["verdict"] = "unresolvable"; meta[k]["reason"] = "no citation attached to the claim"
+        elif kind == "descriptor":
+            meta[k]["verdict"] = "unresolvable"; meta[k]["reason"] = "citation names no record, time or source (descriptor only)"
         elif not idx:
             meta[k]["verdict"] = "unresolved"; meta[k]["reason"] = "citation matches no retrieved record"
         else:
@@ -443,7 +534,7 @@ SCORER_VERSION = 2
 # Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
 # judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
 # the cache; the version is part of the cited cache key.
-RESOLVER_VERSION = 3
+RESOLVER_VERSION = 4
 
 
 def _sha(*parts: str) -> str:

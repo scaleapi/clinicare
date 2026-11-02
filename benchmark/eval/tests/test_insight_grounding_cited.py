@@ -98,7 +98,7 @@ check("unresolved", v[0]["verdict"] == "unresolved" and v[0]["evidence_refs"] ==
 
 print("5. the case's own ids are not citations")
 v = IG.judge_cited(None, "m", [{"claim": "HR value 112", "cited": ["12014968", "20449658"]}], OBS, CASE)
-check("dropped, hence unresolved (handles given but none usable)", v[0]["verdict"] == "unresolved" and v[0]["cited_dropped"] == ["12014968", "20449658"], str(v))
+check("dropped as case ids → descriptor-only citation → unresolvable", v[0]["verdict"] == "unresolvable" and v[0]["citation_kind"] == "descriptor" and v[0]["cited_dropped"] == ["12014968", "20449658"], str(v))
 
 print("6. date handle resolves on its day; tool name resolves to its observations")
 idx, used, dropped = IG.resolve_citations(["2180-01-29 20:00"], OBS, CASE)
@@ -134,6 +134,27 @@ idx, used, dropped = IG.resolve_citations(["get_lab_timeline"], OBS3, CASE)
 check("empty-text call pulls in the same step's exec output only", idx == [0, 1], str(idx))
 v = IG.judge_cited(None, "m", [{"claim": "Creatinine value 2.3", "cited": ["get_lab_timeline"]}], OBS3, CASE)
 check("and the claim is judged supported against those rows", v[0]["verdict"] == "supported", str(v))
+
+print("6d. handle shapes reports actually use")
+OBS4 = OBS + [Observation(step_id=9, tool="list_orders", args={"subject_id": 12014968},
+                          text='[{"poe_id": "12014968-102", "ordertime": "2180-11-12 13:35:00", "order_subtype": "Blood tests"}]')]
+for handle, want in [
+    ('mimic_get_lab_timeline lab_name="hemoglobin"', [0]),      # tool call snippet → that tool
+    ('`list_orders(order_type=["Blood Bank", …])`', [3]),       # tool with args
+    ("HADM 24440629", []),                                      # another encounter, not retrieved → unresolved
+    ("RR-9", [1]),                                              # short note id, any subject prefix
+    ("11-12 13:35", [3]),                                       # month-day time, year elided
+    ("POE", [3]),                                               # source word → table → tool
+    ("discharge narrative", [1]),                               # source word → discharge table → get_note read it
+    ("2180-01-29 20:00 → 21:00", [2]),                          # timestamp range: first stamp's day
+]:
+    idx, used, dropped = IG.resolve_citations([handle], OBS4, CASE)
+    check(f"{handle!r} → {want}", idx == want, str(idx))
+check("value phrase is a descriptor, not a pointer", IG.citation_kind(["Heparin 5000 units"], CASE) == "descriptor")
+check("case id alone is a descriptor", IG.citation_kind(["hadm_id: 20449658"], CASE) == "descriptor")
+check("tool snippet is a pointer", IG.citation_kind(['mimic_get_lab_timeline lab_name="x"'], CASE) == "pointer")
+v = IG.judge_cited(None, "m", [{"claim": "HR value 112", "cited": ["Heparin 5000 units"]}], OBS4, CASE)
+check("descriptor-only citation → unresolvable, not unresolved", v[0]["verdict"] == "unresolvable" and v[0]["citation_kind"] == "descriptor", str(v))
 
 print("7. score() derived rates in cited mode")
 sc = IG.score([{"claim": "a", "cited": ["x"]}], [{"verdict": "supported"}], mode="cited")
