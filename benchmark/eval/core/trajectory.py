@@ -20,6 +20,14 @@ metrics don't care which produced a trace:
     path when the raw log wasn't fetched.
   - codex (gpt):               bare tool names; ``content`` is
     ``"Wall time: N seconds\\nOutput:\\n[{\"type\":\"text\",\"text\":\"<rows-json>\"}]"``.
+  - bash code-mode (``mini-swe-agent``, or any harness whose only tool is ``bash``): NO typed
+    MIMIC tool calls either — the agent drives MIMIC from a Python/curl script inside a ``bash``
+    command (``mcp_server._run_tool("get_note", {...})``, ``curl $MIMIC_TOOLS_URL/call-tool``,
+    ``tools.get_lab_timeline(...)``). ``parse_bash_script`` recovers the calls and the command's
+    stdout is pooled under ``_exec_output`` (see the bash block). What the model saw of a long
+    output is ``output_head`` + ``output_tail`` (mini-swe-agent elides the middle), and that is
+    exactly what enters the pool: the pool is the evidence the agent saw, not the rows the
+    sidecar returned.
   - codex exec-scaffold (``codex_exec``): NO typed MIMIC tool calls — MIMIC is
     invoked from a JS script inside an ``exec`` tool call
     (``tools.mcp__mimic__<tool>({..})``), with rows returned inline or via a
@@ -210,6 +218,132 @@ def parse_exec_script(script: str, step_id: int | None) -> list[Observation]:
     return out
 
 
+# ── bash code-mode support (mini-swe-agent) ─────────────────────────────────────────────────
+# mini-swe-agent exposes ONE tool, `bash`, and no MCP client. Its runs reach MIMIC by scripting
+# the in-container `mimic_tools` package or the sidecar's HTTP API from inside a bash command.
+# Measured on the harness-ablation dump (148 trials): 147 trials returned patient rows this way;
+# the trajectory-typed path sees zero MIMIC calls for all of them. A tool counts as *called* in a
+# step only when (a) its name appears in call position or as a string literal — `get_note(`,
+# `"get_note"`, `'get_note'` — which excludes the agent merely listing tool names in a plan, and
+# (b) the step's command exited 0 with non-empty output, so a script that crashed before reaching
+# the sidecar credits nothing. (a) can still over-count a tool named in a dict the script never
+# sends; that is the same minor over-count the exec-scaffold parser accepts, and it affects
+# retrieval coverage (which unions tables) far less than it would a per-call metric.
+# Three shapes count: the name as a whole string literal (`_run_tool("get_note", ...)`,
+# `{"name": "get_note"}`), the name in call position (`tools.get_note(...)`), or the name as the
+# first argument of a helper script the agent wrote (`python3 call_mimic.py list_notes
+# subject_id=...`). A name inside a longer string (`print("next: get_lab_timeline")`) or in a
+# comment matches none of them.
+_BASH_TOOL_REF = re.compile(
+    r"""["'](get_\w+|list_\w+|search_notes|run_sql)["']"""
+    r"""|\b(get_\w+|list_\w+|search_notes|run_sql)\s*\("""
+    r"""|\.py\s+(get_\w+|list_\w+|search_notes|run_sql)\b"""
+)
+# Scope ids the script passes, however it passes them: `subject_id=1`, `"subject_id": 1`,
+# `subject_id = 1`, `WHERE subject_id = 1`. Only ids that are plausibly arguments (an
+# 8-digit MIMIC id) are kept.
+_SCOPE_ARG = {
+    k: re.compile(rf"""\b{k}\b["']?\s*[:=]\s*["']?(\d{{6,}})""")
+    for k in ("subject_id", "hadm_id", "stay_id")
+}
+# `subject_id IN (1, 2)` in SQL.
+_SCOPE_IN = {
+    k: re.compile(rf"""\b{k}\b\s+in\s*\(([^)]*)\)""", re.I) for k in ("subject_id", "hadm_id", "stay_id")
+}
+
+
+def _bash_output_text(content) -> tuple[int | None, str]:
+    """(returncode, text the model saw) from one bash observation. mini-swe-agent serializes the
+    result as JSON ``{"returncode", "output"}`` or, when the output was too long,
+    ``{"returncode", "output_head", "output_tail", "elided_chars", "warning"}``."""
+    d = None
+    if isinstance(content, str):
+        try:
+            d = json.loads(content)
+        except Exception:
+            return None, content
+    elif isinstance(content, dict):
+        d = content
+    if not isinstance(d, dict):
+        return None, ""
+    rc = d.get("returncode")
+    text = d.get("output")
+    if text is None:
+        text = "\n".join(str(d.get(k) or "") for k in ("output_head", "output_tail"))
+    return (int(rc) if isinstance(rc, int) else None), str(text or "")
+
+
+def parse_bash_script(command: str, step_id: int | None) -> list[Observation]:
+    """Recover MIMIC tool calls referenced in one bash command (see the block comment above).
+    Returns tool Observations with empty ``text``; the command's stdout is pooled separately by
+    ``load_trajectory`` under EXEC_OUTPUT_TOOL. ``args`` carries every scope id the script names
+    (subject_id / hadm_id / stay_id) so the retrieval metric can check patient scope, and run_sql
+    carries each recoverable SQL literal as ``query``."""
+    out: list[Observation] = []
+    names = {m.group(1) or m.group(2) or m.group(3) for m in _BASH_TOOL_REF.finditer(command or "")} & MIMIC_TOOLS
+    if not names:
+        return out
+    # Scope ids are command-wide, so they are attached only when the command names exactly one
+    # value for a key. A script that reads two patients leaves subject_id unset (the calls count
+    # as unscoped) rather than tagging a valid read with the other patient's id and losing it.
+    args: dict = {}
+    for k, rx in _SCOPE_ARG.items():
+        ids = sorted({m.group(1) for m in rx.finditer(command)})
+        if len(ids) == 1:
+            args[k] = ids[0]
+    for name in sorted(names):
+        if name == "run_sql":
+            queries = _sql_literals(command)
+            for q in queries or [None]:
+                a = dict(args)
+                if q is not None:
+                    a["query"] = q
+                out.append(Observation(step_id=step_id, tool="run_sql", args=a, text=""))
+        else:
+            out.append(Observation(step_id=step_id, tool=name, args=dict(args), text=""))
+    return out
+
+
+# ── case scope: which patient / encounter the task is about ─────────────────────────────────
+_CASE_RX = {
+    k: re.compile(rf"""\b{k}\b\s*[=:]?\s*(\d{{6,}})""") for k in ("subject_id", "hadm_id", "stay_id")
+}
+
+
+def case_scope(steps) -> dict[str, set[str]]:
+    """{"subject_id": {...}, "hadm_id": {...}, "stay_id": {...}} named by the task instruction.
+
+    The instruction is the first ``source == "user"`` step; the case sentence precedes the
+    ``---`` that opens the environment boilerplate (which names no ids). Every scenario names
+    the patient (``subject_id=12014968`` or ``For subject_id 16474066``); most name the index
+    admission; ED scenarios name a stay. An empty set means the instruction names none, and a
+    scope check must then abstain rather than flag."""
+    msg = next((s.get("message") or "" for s in steps if s.get("source") == "user"), "")
+    head = msg.split("\n---", 1)[0]
+    return {k: set(rx.findall(head)) for k, rx in _CASE_RX.items()}
+
+
+def call_scope(obs: Observation) -> dict[str, set[str]]:
+    """Scope ids one MIMIC call names, from its typed arguments (``{"subject_id": 10001217}``) or,
+    for run_sql / code-mode scripts, from ``subject_id = N`` / ``subject_id IN (...)`` in the query
+    text. Ids are returned as strings so typed ints and regex captures compare equal."""
+    out: dict[str, set[str]] = {k: set() for k in _SCOPE_ARG}
+    args = obs.args if isinstance(obs.args, dict) else {}
+    for k in out:
+        v = args.get(k)
+        if isinstance(v, (int, str)) and str(v).strip().isdigit():
+            out[k].add(str(v).strip())
+        elif isinstance(v, (list, tuple)):
+            out[k] |= {str(x).strip() for x in v if str(x).strip().isdigit()}
+    q = args.get("query") or args.get("sql") or ""
+    if isinstance(q, str) and q:
+        for k in out:
+            out[k] |= {m.group(1) for m in _SCOPE_ARG[k].finditer(q)}
+            for m in _SCOPE_IN[k].finditer(q):
+                out[k] |= {x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip().strip("'\"").isdigit()}
+    return out
+
+
 # ── opencode raw-log support ────────────────────────────────────────────────────────────────
 # The opencode harness's normalized trajectory.json is lossy: some steps keep the `mimic_`
 # tool_calls but an empty `observation` (row outputs dropped). The raw `agent/opencode.txt`
@@ -382,6 +516,39 @@ def load_trajectory(path) -> Trajectory:
             if tc.get("function_name") == "exec":
                 script = (tc.get("arguments") or {}).get("input", "")
                 observations.extend(parse_exec_script(script, s.get("step_id")))
+
+        # bash code-mode (mini-swe-agent): MIMIC calls live inside the bash command's script and
+        # the rows come back as the command's stdout. Credit the referenced tools only when the
+        # command succeeded and printed something. EVERY successful command's stdout is pooled as
+        # evidence, not only the steps that name a tool: these agents save tool output to files
+        # and read it back in later steps (`cat out.json`, `python3 helper.py ...`), and the pool
+        # is defined as what the agent saw. Measured on the harness-ablation arm, all 28 record ids
+        # flagged as fabricated under tool-step-only pooling were in the stdout of such steps. The
+        # exec-scaffold path pools every exec/wait output for the same reason. The cost is that an
+        # id the agent itself echoes (`echo "subject_id=..."`) counts as seen; that is a case id
+        # from the instruction in practice, and the exec path already accepts the same.
+        bash_calls = {
+            tc.get("tool_call_id"): tc
+            for tc in s.get("tool_calls", [])
+            if tc.get("function_name") == "bash"
+        }
+        if bash_calls:
+            for item in (s.get("observation", {}) or {}).get("results", []) or []:
+                tc = bash_calls.get(item.get("source_call_id"))
+                # mini-swe-agent's results carry no source_call_id; with one bash call per step
+                # (its protocol) the pairing is unambiguous.
+                if tc is None and item.get("source_call_id") is None and len(bash_calls) == 1:
+                    tc = next(iter(bash_calls.values()))
+                if tc is None:
+                    continue
+                rc, text = _bash_output_text(item.get("content"))
+                if rc not in (0, None) or not text.strip():
+                    continue
+                cmd = (tc.get("arguments") or {}).get("command", "") or ""
+                observations.extend(parse_bash_script(cmd, s.get("step_id")))
+                observations.append(
+                    Observation(step_id=s.get("step_id"), tool=EXEC_OUTPUT_TOOL, args={}, text=text)
+                )
 
         for item in (s.get("observation", {}) or {}).get("results", []) or []:
             tc = calls.get(item.get("source_call_id"))

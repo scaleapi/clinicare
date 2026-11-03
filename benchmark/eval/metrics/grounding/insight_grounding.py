@@ -93,6 +93,23 @@ def pool_ids(pool: str) -> set[str]:
     return _extract_ids(pool, drop_compound_prefixes=False)
 
 
+def evidence_observations(trial_dir: Path) -> tuple[list, bool, bool]:
+    """The evidence the agent saw, as a list of per-call Observations (step_id, tool, args, text),
+    plus (used_subagent, subagent_recovered). Same content as :func:`evidence_pool`, kept
+    per call so a claim can be judged against the specific records it cites: sub-agent
+    tool-call args become Observations with tool ``_subagent_args`` and the args as text."""
+    traj = load_trajectory(trial_dir / "trajectory.json")
+    obs = list(traj.observations)
+    sub = subagent_observations(trial_dir) if traj.used_subagent else []
+    for o in sub:
+        if isinstance(o.args, dict):
+            obs.append(
+                type(o)(step_id=o.step_id, tool="_subagent_args", args=o.args,
+                        text=" ".join(str(v) for v in o.args.values()))
+            )
+    return obs, traj.used_subagent, bool(sub)
+
+
 def evidence_pool(trial_dir: Path) -> tuple[str, bool, bool]:
     """The text the agent actually saw, to check citations against. Returns
     (pool_text, used_subagent, subagent_recovered).
