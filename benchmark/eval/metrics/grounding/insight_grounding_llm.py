@@ -341,9 +341,17 @@ def resolve_citations(
         if not hl or hl in case_ids or not probes:
             dropped.append(h)
             continue
+        # A handle resolves through its MOST SPECIFIC probe tier only: a record id if it has one,
+        # else a timestamp, else a tool, else a table / source word. `radiology report
+        # 12014968-RR-99` therefore stands or falls on RR-99; the words "radiology report" do not
+        # widen it to every radiology row, which would credit a citation to a note never retrieved.
         found: set[int] = set()
-        for k, v in probes:
-            found |= _probe_hits(k, v, observations)
+        for tier in (("id", "note"), ("ts", "md", "time"), ("tool",), ("table",)):
+            tier_probes = [(k, v) for k, v in probes if k in tier]
+            if tier_probes:
+                for k, v in tier_probes:
+                    found |= _probe_hits(k, v, observations)
+                break
         (used if found else dropped).append(h)
         hits |= found
     # Follow code-mode calls to their rows.
@@ -534,7 +542,7 @@ SCORER_VERSION = 2
 # Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
 # judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
 # the cache; the version is part of the cited cache key.
-RESOLVER_VERSION = 4
+RESOLVER_VERSION = 5
 
 
 def _sha(*parts: str) -> str:

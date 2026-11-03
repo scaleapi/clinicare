@@ -150,6 +150,12 @@ for handle, want in [
 ]:
     idx, used, dropped = IG.resolve_citations([handle], OBS4, CASE)
     check(f"{handle!r} → {want}", idx == want, str(idx))
+idx, used, dropped = IG.resolve_citations(["radiology report 12014968-RR-99"], OBS4, CASE)
+check("source word + an id never retrieved → unresolved, not every radiology row", idx == [] and dropped == ["radiology report 12014968-RR-99"], str((idx, dropped)))
+idx, used, dropped = IG.resolve_citations(["radiology report 12014968-RR-9"], OBS4, CASE)
+check("source word + a retrieved id → that record only", idx == [1], str(idx))
+idx, used, dropped = IG.resolve_citations(["get_lab_timeline 2180-01-29 20:00"], OBS4, CASE)
+check("tool + timestamp → the timestamp tier (more specific) wins", idx == [2], str(idx))
 check("value phrase is a descriptor, not a pointer", IG.citation_kind(["Heparin 5000 units"], CASE) == "descriptor")
 check("case id alone is a descriptor", IG.citation_kind(["hadm_id: 20449658"], CASE) == "descriptor")
 check("tool snippet is a pointer", IG.citation_kind(['mimic_get_lab_timeline lab_name="x"'], CASE) == "pointer")
