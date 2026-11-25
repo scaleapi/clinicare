@@ -148,7 +148,12 @@ python benchmark/eval/gold/build_gold.py --annotation <your-copy.csv>
 #    A required table is credited only when the call that read it named the case's patient
 #    (subject_id in the typed args or in the run_sql text); calls that name no subject_id are
 #    credited and counted `unscoped`; another encounter of the same patient is counted, not
-#    penalised. --no-scope reproduces the published numbers; --out writes per-trial JSON.
+#    penalised. --no-scope reproduces the published behaviour; --out writes per-trial JSON.
+#    Two means are printed. The first is over grounding-scoreable trials (report present, at
+#    least one patient record in the trace) and is the number the paper reports. The second is
+#    over every scored trial and counts a trial with no patient record in its trace as 0; the
+#    two differ where an agent worked through shell commands or a sub-agent (about 5% of
+#    opencode runs).
 python $G/evidence_retrieval_recall.py --traces <traces> [--no-scope] [--out rr.json]
 
 # 4. insight_grounding T1 — trace-only, no gold, no LLM

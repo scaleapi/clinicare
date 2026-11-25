@@ -38,7 +38,7 @@ from clinicare_core.paths import bootstrap
 
 bootstrap(__file__, "eval")
 from core.scenarios import slug_from_trial_dir  # noqa: E402
-from core.trajectory import EXEC_OUTPUT_TOOL, MIMIC_TOOLS, load_trajectory  # noqa: E402
+from core.trajectory import grounding_scoreable  # noqa: E402
 
 # Harness family from the arm name (run_sweep.py tags): the harness is the first token after
 # the cohort prefix. `claude` is Claude Code, `codex` is Codex, `gemini` is Gemini CLI,
@@ -63,19 +63,7 @@ def family_of(run: str, cohort: str = "full750") -> str | None:
 
 
 def scoreable(trial: Path) -> bool:
-    report = trial / "verifier" / "report.md"
-    tj = trial / "agent" / "trajectory.json"
-    if not report.exists() or not tj.exists():
-        return False
-    if "Environment: degraded" in report.read_text(errors="replace"):
-        return False
-    traj = load_trajectory(tj)
-    obs = traj.observations
-    if any(o.tool in MIMIC_TOOLS and o.text.strip() for o in obs):
-        return True
-    return any(o.tool in MIMIC_TOOLS for o in obs) and any(
-        o.tool == EXEC_OUTPUT_TOOL and o.text.strip() for o in obs
-    )
+    return grounding_scoreable(trial)
 
 
 def paired(args, want: list[str], rng: random.Random) -> int:

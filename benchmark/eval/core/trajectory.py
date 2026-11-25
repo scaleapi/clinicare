@@ -455,6 +455,30 @@ class Trajectory:
         return [o for o in self.observations if o.tool == normalize_tool(tool)]
 
 
+def grounding_scoreable(trial_dir, traj: "Trajectory | None" = None) -> bool:
+    """The paper's grounding-scoreable run: a report is present and the agent retrieved at least
+    one patient record. The four patient-evidence grounding metrics are averaged over these runs
+    only. A run in which the trace records no patient-data result (the agent worked through shell
+    commands or an unrecovered sub-agent, or wrote a report without looking anything up) has
+    nothing to score: counting it as zero coverage would measure the trace, not the retrieval.
+
+    Code mode records a MIMIC call with empty text and its rows in a pooled exec output, so a
+    call plus a non-empty exec output also counts as a retrieved record."""
+    trial_dir = Path(trial_dir)
+    report = trial_dir / "verifier" / "report.md"
+    tj = trial_dir / "agent" / "trajectory.json"
+    if not report.exists() or not tj.exists():
+        return False
+    if "Environment: degraded" in report.read_text(errors="replace"):
+        return False
+    obs = (traj or load_trajectory(tj)).observations
+    if any(o.tool in MIMIC_TOOLS and o.text.strip() for o in obs):
+        return True
+    return any(o.tool in MIMIC_TOOLS for o in obs) and any(
+        o.tool == EXEC_OUTPUT_TOOL and o.text.strip() for o in obs
+    )
+
+
 def subagent_observations(trial_dir) -> list[Observation]:
     """MIMIC tool calls made *inside* sub-agents, recovered from claude-code's raw session
     JSONL (``subagents/*.jsonl`` next to the trace) — which the normalized trajectory.json

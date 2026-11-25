@@ -9,6 +9,8 @@ applicable, encounter and temporal scope". These tests pin down exactly what the
   3. a call that names no subject_id (get_note by note_id) is credited and counted `unscoped`;
   4. run_sql scope is read from the query text (`subject_id = N`, `IN (...)`);
   5. the case ids come from the task instruction in both phrasings the scenarios use;
+  7. a run is grounding-scoreable (the paper's denominator) only with a report and at least one
+     patient record in its trace;
   6. mini-swe-agent's bash code mode: tool calls inside a Python heredoc are recovered with their
      scope ids, a failed command credits nothing, and the command's stdout (head+tail when the
      harness elided the middle) enters the evidence pool.
@@ -141,6 +143,30 @@ check("elided output pooled as head+tail", any("31929757" in o.text and "18:12:3
 check("stay_id from rows is in the evidence pool", "31929757" in t.evidence_text)
 st = _scope_stats()
 check("R_retrieval credits icustays + notes for the bash trial", {"icustays", "discharge", "radiology"} <= retrieved_tables(t.observations, case_scope(t.steps), st) and st["in_scope"] == 3, str(st))
+
+print("7. grounding-scoreable: report present and at least one patient record in the trace")
+from core.trajectory import grounding_scoreable
+
+
+def trial_dir(root, name, trajectory, report="# Report\nVerdict: Yes\n"):
+    t = Path(root) / name
+    (t / "agent").mkdir(parents=True); (t / "verifier").mkdir()
+    (t / "agent" / "trajectory.json").write_text(json.dumps(trajectory))
+    if report is not None:
+        (t / "verifier" / "report.md").write_text(report)
+    return t
+
+
+shell_only = {"schema_version": "1", "agent": {"name": "opencode", "model_name": "m"},
+              "steps": [{"step_id": 1, "source": "user", "message": msg_eq},
+                        bash_step(2, "echo starting", json.dumps({"returncode": 0, "output": "starting"}))]}
+with tempfile.TemporaryDirectory() as d:
+    check("a run that retrieved patient records and wrote a report is scoreable", grounding_scoreable(trial_dir(d, "a", traj)))
+    check("a run whose trace records no patient-data call is not (it would otherwise score 0 coverage)",
+          not grounding_scoreable(trial_dir(d, "b", shell_only)))
+    check("no report: not scoreable", not grounding_scoreable(trial_dir(d, "c", traj, report=None)))
+    check("a degraded-environment report: not scoreable",
+          not grounding_scoreable(trial_dir(d, "e", traj, report="Environment: degraded\n")))
 
 print()
 if _fails:

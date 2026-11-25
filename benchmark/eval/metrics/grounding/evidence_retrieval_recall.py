@@ -56,6 +56,7 @@ from core.trajectory import (  # noqa: E402
     Observation,
     call_scope,
     case_scope,
+    grounding_scoreable,
     load_trajectory,
     subagent_observations,
 )
@@ -377,7 +378,7 @@ def main() -> int:
         sys.exit(f"no trajectories under {args.traces}")
 
     seen_match: dict[str, str] = {}
-    rows, recalls = [], []
+    rows, recalls, scoreable_recalls = [], [], []
     for tj in trials:
         run, slug = tj.parts[-4], tj.parts[-3]
         g = match_scenario(slug, gold)
@@ -413,9 +414,16 @@ def main() -> int:
         # only the parent-visible SUMMARY of a sub-agent, never its own tool results, so the pool is
         # knowingly incomplete and a low recall would be an artifact.
         s["na"] = traj.used_subagent and not sub
+        # The paper averages the grounding metrics over grounding-scoreable runs only (report
+        # present, at least one patient record retrieved). Recovered sub-agent rows count.
+        s["scoreable"] = grounding_scoreable(tj.parents[1], traj) or (
+            bool(sub) and (tj.parents[1] / "verifier" / "report.md").exists()
+        )
         rows.append((run, slug, traj.agent, s))
         if s["recall"] is not None and not s["na"]:
             recalls.append(s["recall"])
+            if s["scoreable"]:
+                scoreable_recalls.append(s["recall"])
 
     print("=== scenario → annotation join (by task number) ===")
     for slug, m in sorted(seen_match.items()):
@@ -424,17 +432,27 @@ def main() -> int:
     print(f"\n{'run':30s} {'scenario':18s} {'recall':>6s} {'missed tables'}")
     for run, slug, agent, s in rows:
         rec = "  NA" if s["na"] else (f"{s['recall']:.2f}" if s["recall"] is not None else "  -")
-        flag = ""
+        flag = "" if s["scoreable"] or s["na"] else " [not grounding-scoreable: no patient record in the trace]"
         if s["subagent_recovered"]:
-            flag = " [subagent calls recovered from sessions]"
+            flag += " [subagent calls recovered from sessions]"
         elif s["na"]:
-            flag = " [subagent: sessions not fetched → re-fetch to score]"
+            flag += " [subagent: sessions not fetched → re-fetch to score]"
         print(f"  {run[:28]:28s} {slug:18s} {rec:>6s} {s['missed'] or ''}{flag}")
         if args.verbose:
             print(f"      gold={s['gold']}\n      got ={s['retrieved']}")
 
+    if scoreable_recalls:
+        # R_retrieval as the paper reports it.
+        print(
+            f"\nmean recall over {len(scoreable_recalls)} grounding-scoreable trials: "
+            f"{sum(scoreable_recalls)/len(scoreable_recalls):.3f}"
+        )
     if recalls:
-        print(f"\nmean recall over {len(recalls)} trials: {sum(recalls)/len(recalls):.3f}")
+        dropped = len(recalls) - len(scoreable_recalls)
+        print(
+            f"mean recall over all {len(recalls)} scored trials: {sum(recalls)/len(recalls):.3f}"
+            + (f"   ({dropped} with no patient record in the trace count as 0 here)" if dropped else "")
+        )
     if not args.no_scope and rows:
         tot = {k: sum(s["scope"][k] for _, _, _, s in rows) for k in ("calls", "in_scope", "unscoped", "wrong_patient", "other_encounter")}
         flagged = sum(1 for _, _, _, s in rows if s["scope"]["wrong_patient"])
