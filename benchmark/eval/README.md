@@ -159,10 +159,24 @@ python $G/insight_grounding_llm.py --traces <traces> --limit 3 --verbose
 #    --evidence pool  (default) judges every claim against everything the agent retrieved —
 #                     retrieved-evidence support, the published P_claim; evidence_refs="all"
 #    --evidence cited judges each claim only against the records its citation resolves to
-#                     (claim–citation pairs); adds unresolvable / unresolved verdicts,
-#                     resolvable_frac and strict_on_resolvable; separate cache file
+#                     (claim–citation pairs); separate cache file. Reports two components:
+#                       coverage           share of claims that cite a record, source or date
+#                       citation_precision of the cited claims, the share the cited evidence supports
+#                     Which citation belongs to a claim is decided by rule, not by the model: the
+#                     report is cut into numbered sentences, the model says which sentence each
+#                     claim came from, and the citation is read off that sentence, else off the
+#                     rest of its paragraph / list item / table row (cited_scope per claim;
+#                     coverage_sentence / citation_precision_sentence are the sentence-only
+#                     reading). Claims are extracted once per report (insight_claims_units.json)
+#                     and reused, so re-judging scores the same claims.
 #    --trials-from F  grade only the trial dirs listed in F (see sample_reports.py)
 python $G/insight_grounding_llm.py --traces <traces> --evidence cited --trials-from sample.txt
+#    Paired sample + per-system table (citation coverage / citation precision, same cases for
+#    every system):
+python $G/sample_reports.py --traces <traces> --paired-per-scenario 2 --seed 20261125 \
+    --out-list paired_trials.txt --out-csv paired_manifest.csv
+python $G/insight_grounding_llm.py --traces <traces> --evidence cited --trials-from paired_trials.txt
+python $G/citation_table.py --traces <traces> --manifest paired_manifest.csv
 
 # 6. (only if the annotation changes) rebuild the required-evidence rubric
 python benchmark/eval/gold/build_required_evidence.py --annotation <your-copy.csv>

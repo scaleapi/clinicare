@@ -162,50 +162,6 @@ def extract_claims(client, model: str, report: str) -> list[str]:
     return claims
 
 
-_EXTRACT_CITED_PROMPT = """You are extracting atomic factual claims, WITH THEIR CITATIONS, from a \
-clinical decision report for grounding verification.
-
-Extract every claim that asserts a SPECIFIC, checkable clinical or quantitative fact drawn \
-from the patient's record: lab/vital values, medication names & doses, imaging/procedure \
-findings, counts, dates of events, and presence/absence of a clinical event or order.
-
-For EACH claim also copy, VERBATIM from the report, every citation handle the report attaches \
-to that claim — the record identifiers (note ids like 12014968-RR-9, order/poe ids like \
-10001217-107, stay_id / hadm_id values), the timestamps or dates the claim is pinned to \
-(e.g. 2180-01-30 15:27:00), and the tool or table named as the source (e.g. get_imaging_studies, \
-labevents). A handle belongs to a claim when the report places it in the same sentence, table \
-row, bullet, or bracketed citation as the fact. Do NOT invent handles; if the report gives none \
-for a claim, return an empty list.
-
-Rules:
-- One atomic claim per item — split compound sentences.
-- Keep the entity/context that makes it checkable (which patient/stay, what time, what test).
-- EXCLUDE: the final verdict, restatements of the task criteria, methodology/reasoning \
-sentences, and claims whose only content is a record ID (those are checked separately).
-- Do NOT invent claims; only extract what the report states.
-
-Return ONLY a JSON array of objects, e.g.
-[{{"claim": "Serum creatinine peaked at 2.3 mg/dL on 2180-09-20", "cited": ["2180-09-20", "get_lab_timeline"]}}, ...]
-
-REPORT:
-{report}
-"""
-
-
-def extract_claims_cited(client, model: str, report: str) -> list[dict]:
-    raw = _call(client, model, _EXTRACT_CITED_PROMPT.format(report=report))
-    out = []
-    for o in _json_array(raw):
-        if isinstance(o, dict) and isinstance(o.get("claim"), str) and o["claim"].strip():
-            cited = o.get("cited") or []
-            out.append({"claim": o["claim"].strip(), "cited": [str(c).strip() for c in cited if str(c).strip()]})
-        elif isinstance(o, str) and o.strip():
-            out.append({"claim": o.strip(), "cited": []})
-    return out
-
-
-# A date handle resolves on its calendar day: the report may write "2180-01-30 15:27" where
-# the row says "2180-01-30 15:27:00", so matching the full string would miss its own source.
 _DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 # Every physical table a tool reads, canonicalised the way the gold names them, so a citation
 # like `labevents` resolves to get_lab_timeline rows and `radiology` to get_imaging_studies.
@@ -249,7 +205,11 @@ _SOURCE_WORDS = {
 }
 _TOOL_IN_HANDLE = re.compile(r"(get_[a-z_]+|list_[a-z_]+|search_notes|run_sql)")
 _LONG_ID = re.compile(r"\d{6,}(?:-[A-Z]{1,4}-\d+|-\d+)?")           # 12014968, 12014968-RR-9, 10001217-107
-_SHORT_NOTE = re.compile(r"\b([A-Z]{1,4})-(\d+)\b")                    # RR-9 / DS-21 without the subject prefix
+# RR-9 / DS-21 without the subject prefix. Only the note types MIMIC-IV-Note has (discharge
+# summary, radiology report, radiology addendum): a looser [A-Z]{1,4}-\d+ also matches ICD-9,
+# CURB-65 and POD-2, which are not citations and would be scored as citations to a note that was
+# never retrieved.
+_SHORT_NOTE = re.compile(r"\b(DS|RR|AR)-(\d+)\b")
 _FULL_TS = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?")          # 2180-01-30 15:27
 _MD_TS = re.compile(r"(?<!\d)(\d{1,2})[-/](\d{1,2})[ T]+(\d{2}:\d{2})")   # 11-12 13:35, 5/3 10:55 (year elided)
 _TIME_ONLY = re.compile(r"(?<![\d:])(\d{2}:\d{2})(?![\d:])")            # 20:17 (a window the report itself set)
@@ -383,6 +343,206 @@ def citation_kind(cited: list[str], case: dict[str, set[str]]) -> str:
     return "descriptor"
 
 
+# ── (1b) cited mode: which citation belongs to a claim ─────────────────────────────────────
+# Decided by rule, not by the extraction model. Asked to copy "the citation attached to each
+# claim", the model answers differently on a re-run of the same report (citation coverage moved
+# 0.13 per report between runs on a 24-report check); asked only for the NUMBER of the sentence a
+# claim came from, with the citation read off that sentence by the rule below, it moved 0.04, and
+# what is left is the model listing slightly different claims, not attaching them differently.
+#
+# The rule. The report is cut into units: a sentence of running text, a list item's sentences, or
+# one table row. A claim's citation is every citation handle in its own unit; when its unit has
+# none, every handle in the rest of the same block (paragraph, list item or table row), because
+# reports routinely name the note or tool once at the head of a bullet and then describe it. The
+# scope that supplied the citation is recorded per claim ("sentence" / "block" / "none"), so the
+# stricter sentence-only reading can be computed from the same output.
+#
+# A citation handle is (1) a backtick, bracket or parenthetical span that names a tool, a table or
+# source type, a record id, or a full date; (2) outside such spans, a tool name, a MIMIC table
+# name, a record id, or a full date. Policy citations ([policy: file.md L1-L9]) are not
+# patient-evidence citations and are skipped.
+UNITS_VERSION = 1
+
+_LIST_ITEM = re.compile(r"^\s*([-*+•]|\d+[.)])\s+")
+_ABBREV_END = re.compile(r"\b(?:e\.g|i\.e|vs|Dr|No|approx|Fig|cf|etc|al|incl|est|min|max|hr|hrs)\.$", re.I)
+_SENT_SPLIT = re.compile(r"(?<=[.!?;])[\"')\]*`_]*\s+(?=[A-Z0-9\[(*`\"“])")
+_CITATION_ONLY = re.compile(r"^\s*(?:(?:\[[^\]]*\]|\([^)]*\)|`[^`]*`)[\s,;.]*)+$")
+_MIN_SENTENCE = 25
+
+
+def report_blocks(report: str) -> list[str]:
+    """Blocks of a markdown report: a heading, a table row, a list item (with its continuation
+    lines), or a paragraph. Blank lines, rules and table separator rows end a block."""
+    out: list[str] = []
+    cur: list[str] = []
+
+    def flush() -> None:
+        if cur:
+            out.append(" ".join(s.strip() for s in cur))
+            cur.clear()
+
+    for line in report.splitlines():
+        s = line.strip()
+        if not s or re.fullmatch(r"[-=*_]{3,}", s):
+            flush()
+        elif s.startswith("#"):
+            flush()
+            out.append(s)
+        elif s.startswith("|"):
+            flush()
+            if not re.fullmatch(r"[|\s:-]+", s):
+                out.append(s)
+        else:
+            if _LIST_ITEM.match(line):
+                flush()
+            cur.append(line)
+    flush()
+    return out
+
+
+def report_units(report: str) -> list[dict]:
+    """The report as units: [{"block": i, "text": ...}]. Headings and table rows are one unit;
+    other blocks are split into sentences. A fragment shorter than _MIN_SENTENCE characters or
+    ending in an abbreviation is joined to what follows, and a fragment that is only a citation
+    is joined to the sentence before it."""
+    units: list[dict] = []
+    for b, text in enumerate(report_blocks(report)):
+        if text.startswith("|") or text.startswith("#"):
+            units.append({"block": b, "text": text})
+            continue
+        parts: list[str] = []
+        buf = ""
+        for piece in _SENT_SPLIT.split(text):
+            buf = f"{buf} {piece}".strip()
+            if _ABBREV_END.search(buf) or len(buf) < _MIN_SENTENCE:
+                continue
+            parts.append(buf)
+            buf = ""
+        if buf:
+            if parts:
+                parts[-1] = f"{parts[-1]} {buf}"
+            else:
+                parts.append(buf)
+        merged: list[str] = []
+        for part in parts:
+            if merged and _CITATION_ONLY.match(part):
+                merged[-1] = f"{merged[-1]} {part}"
+            else:
+                merged.append(part)
+        units.extend({"block": b, "text": part} for part in merged)
+    return units
+
+
+_CITE_SPAN = re.compile(r"`[^`\n]+`|\[[^\]\n]+\]|\([^()\n]+\)")
+_STRONG_PROBES = {"tool", "id", "note", "ts", "table"}
+# MIMIC table names that are not ordinary English words: a source even in running text.
+_BARE_TABLE = re.compile(
+    r"(?<![A-Za-z_])(chartevents|labevents|inputevents|outputevents|microbiologyevents|procedureevents|"
+    r"diagnoses_icd|procedures_icd|drgcodes|edstays|icustays|emar|poe|medrecon|pyxis|vitalsign)(?![A-Za-z_])",
+    re.I,
+)
+
+
+def unit_handles(text: str) -> list[str]:
+    """Citation handles in one unit, by the rule above. Order of first appearance, no repeats."""
+    handles: list[str] = []
+    for m in _CITE_SPAN.finditer(text):
+        span = m.group(0)
+        if re.match(r"[\[(`]\s*policy", span, re.I) or re.search(r"\.md\b", span):
+            continue
+        inner = span[1:-1].strip()
+        if {k for k, _ in _handle_probes(inner)} & _STRONG_PROBES:
+            handles.append(inner)
+    rest = _CITE_SPAN.sub(" ", text)
+    handles += [m.group(0) for m in _TOOL_IN_HANDLE.finditer(rest.lower()) if m.group(1) in MIMIC_TOOLS]
+    for rx in (_LONG_ID, _SHORT_NOTE, _FULL_TS, _BARE_TABLE):
+        handles += [m.group(0) for m in rx.finditer(rest)]
+    return list(dict.fromkeys(handles))
+
+
+def attach_citation(units: list[dict], i: int) -> tuple[list[str], str]:
+    """(handles, scope) for a claim taken from unit `i`: the unit's own handles ("sentence"), else
+    the handles of the other units of its block ("block"), else ([], "none")."""
+    if not 0 <= i < len(units):
+        return [], "none"
+    own = unit_handles(units[i]["text"])
+    if own:
+        return own, "sentence"
+    block: list[str] = []
+    for u in units:
+        if u["block"] == units[i]["block"]:
+            block += unit_handles(u["text"])
+    block = list(dict.fromkeys(block))
+    return (block, "block") if block else ([], "none")
+
+
+def pointer_kind(cited: list[str], case: dict[str, set[str]]) -> str:
+    """What the citation points with, strongest first: a record id ("record"), a tool or table
+    ("source"), only a date or time ("date"), or nothing ("none"). The case's own ids do not
+    count, as in resolve_citations."""
+    case_ids = set().union(*case.values()) if case else set()
+    kinds = {k for h in cited for k, v in _handle_probes(h.strip().strip("`*_[]()")) if not (k == "id" and v in case_ids)}
+    if kinds & {"id", "note"}:
+        return "record"
+    if kinds & {"tool", "table"}:
+        return "source"
+    if kinds & {"ts", "md", "time"}:
+        return "date"
+    return "none"
+
+
+_EXTRACT_UNITS_PROMPT = _EXTRACT_PROMPT.split("Return ONLY")[0] + """\
+The report is given below as numbered units: one sentence, list item sentence or table row per \
+unit. For EACH claim give the number of the unit it was taken from.
+
+Return ONLY a JSON array of objects, e.g.
+[{{"claim": "Serum creatinine peaked at 2.3 mg/dL on 2180-09-20", "unit": 14}}, ...]
+
+REPORT (numbered units):
+{report}
+"""
+
+
+def extract_claims_units(client, model: str, units: list[dict]) -> list[dict]:
+    """[{"claim": ..., "unit": zero-based unit index, or -1 when the model gave no usable number}]."""
+    numbered = "\n".join(f"[{i + 1}] {u['text']}" for i, u in enumerate(units))
+    out = []
+    for o in _json_array(_call(client, model, _EXTRACT_UNITS_PROMPT.format(report=numbered))):
+        if not (isinstance(o, dict) and isinstance(o.get("claim"), str) and o["claim"].strip()):
+            continue
+        try:
+            i = int(o.get("unit")) - 1
+        except (TypeError, ValueError):
+            i = -1
+        out.append({"claim": o["claim"].strip(), "unit": i if 0 <= i < len(units) else -1})
+    return out
+
+
+# Claims are extracted once per report and kept next to the verdict cache, so that re-judging
+# (a resolver change, a different evidence mode) scores the same claims instead of a fresh draw.
+CLAIMS_CACHE_NAME = "insight_claims_units.json"
+
+
+def claims_key(report: str, judge_model: str, base_url: str = "") -> dict:
+    return {"units_version": UNITS_VERSION, "judge_model": judge_model, "judge_base_url": base_url,
+            "prompt_sha": _sha(_EXTRACT_UNITS_PROMPT), "report_sha256": _sha(report)}
+
+
+def load_or_extract_claims(client, model: str, report: str, base_url: str, cache: Path | None) -> list[dict]:
+    key = claims_key(report, model, base_url)
+    if cache is not None and cache.exists():
+        try:
+            d = json.loads(cache.read_text())
+            if all(d.get(k) == v for k, v in key.items()) and isinstance(d.get("claims"), list):
+                return d["claims"]
+        except (OSError, ValueError):
+            pass
+    claims = extract_claims_units(client, model, report_units(report))
+    if cache is not None:
+        cache.write_text(json.dumps({**key, "claims": claims}, indent=2))
+    return claims
+
+
 # ── (2) judge claims against retrieved evidence ────────────────────────────────────────────
 _JUDGE_PROMPT = """You are verifying whether clinical claims are grounded in the evidence a \
 research agent actually retrieved from a patient's medical record.
@@ -498,6 +658,17 @@ def score(claims: list[str], verdicts: list[dict], mode: str = "pool") -> dict:
         n_res = len(claims) - counts.get("unresolvable", 0)
         out["resolvable_frac"] = n_res / len(claims) if claims else None
         out["strict_on_resolvable"] = counts["supported"] / n_res if n_res else None
+        # The two components reported in the paper. coverage: share of claims that cite a record,
+        # source or date (a citation that matches nothing retrieved still counts as a citation).
+        # citation_precision: of those, the share the cited evidence supports. The `_sentence`
+        # pair restricts "cites" to a citation in the claim's own sentence.
+        cited = [d for d in detail if d.get("citation_kind") == "pointer"]
+        sent = [d for d in cited if d.get("cited_scope") == "sentence"]
+        sup = lambda ds: sum(1 for d in ds if str(d.get("verdict", "")).lower() == "supported")  # noqa: E731
+        out["coverage"] = len(cited) / len(claims) if claims else None
+        out["citation_precision"] = sup(cited) / len(cited) if cited else None
+        out["coverage_sentence"] = len(sent) / len(claims) if claims else None
+        out["citation_precision_sentence"] = sup(sent) / len(sent) if sent else None
     return out
 
 
@@ -542,7 +713,7 @@ SCORER_VERSION = 2
 # Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
 # judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
 # the cache; the version is part of the cited cache key.
-RESOLVER_VERSION = 5
+RESOLVER_VERSION = 7
 
 
 def _sha(*parts: str) -> str:
@@ -587,14 +758,15 @@ def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mod
         # against changed grading logic. That is a likelier mistake than any of the above.
         "prompts_sha": _sha(_EXTRACT_PROMPT, _JUDGE_PROMPT)
         if mode == "pool"
-        else _sha(_EXTRACT_CITED_PROMPT, _JUDGE_PROMPT),
+        else _sha(_EXTRACT_UNITS_PROMPT, _JUDGE_PROMPT),
         "inputs_sha256": _sha(report, pool),
         # Which evidence each claim is judged against (see module doc). Omitted for pool mode so
         # every cache written before the mode existed stays valid — pool mode IS that behaviour.
         # Cited mode resolves citations through each observation's tool, step and arguments and
         # the case ids, none of which the flattened pool text captures; `structure` is their
         # serialisation (see cited_structure), so a corrected trace re-grades.
-        **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION, "structure_sha": _sha(structure)}
+        **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION, "units_version": UNITS_VERSION,
+            "structure_sha": _sha(structure)}
            if mode != "pool" else {}),
     }
 
@@ -657,7 +829,8 @@ def cited_structure(observations: list, case: dict) -> str:
 
 
 def grade_one(report: str, pool: str, env: dict, model: str, expect: dict,
-              mode: str = "pool", observations: list | None = None, case: dict | None = None) -> dict:
+              mode: str = "pool", observations: list | None = None, case: dict | None = None,
+              claims_cache: Path | None = None) -> dict:
     """Score ONE trial from already-loaded inputs. Errors come back IN BAND rather than raising:
     one bad trial must not kill the pool, and `cached_ok` uses the `error` key to force a retry.
 
@@ -667,7 +840,12 @@ def grade_one(report: str, pool: str, env: dict, model: str, expect: dict,
     try:
         client = make_client(env)
         if mode == "cited":
-            claims = extract_claims_cited(client, model, report)
+            units = report_units(report)
+            claims = [dict(c) for c in load_or_extract_claims(
+                client, model, report, env.get("JUDGE_BASE_URL", ""), claims_cache)]
+            for c in claims:
+                c["cited"], c["cited_scope"] = attach_citation(units, c["unit"])
+                c["pointer"] = pointer_kind(c["cited"], case or {})
             verdicts = judge_cited(client, model, claims, observations or [], case or {})
             return {**expect, **score(claims, verdicts, mode)}
         claims = extract_claims(client, model, report)
@@ -780,7 +958,8 @@ def main() -> int:
     if todo:
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
             futs = {
-                ex.submit(grade_one, report, pool, env, model, expect, mode, obs, case): tj
+                ex.submit(grade_one, report, pool, env, model, expect, mode, obs, case,
+                          tj.parents[1] / "verifier" / CLAIMS_CACHE_NAME): tj
                 for tj, report, pool, expect, obs, case in todo
             }
             for n, f in enumerate(as_completed(futs), 1):

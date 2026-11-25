@@ -15,6 +15,11 @@ statement about WHICH EVIDENCE reached the judge, which is the thing under dispu
   5. the case's own subject_id / hadm_id are not citations (every row carries them).
   6. a date handle resolves on its calendar day; a tool name resolves to that tool's observations.
   7. score() exposes resolvable_frac and strict_on_resolvable in cited mode only.
+  8. the cache key differs by evidence mode.
+  9. which citation belongs to a claim is decided by rule: the claim's own sentence, else the rest
+     of its paragraph / list item / table row; policy citations and the case's own ids are not
+     patient-evidence citations; a paragraph break ends the scope.
+ 10. claims are extracted once per report and reused, so re-judging scores the same claims.
 
     python benchmark/eval/tests/test_insight_grounding_cited.py
 """
@@ -180,6 +185,78 @@ check("cited key changes when the observation structure changes", k_cit["structu
 check("pool key unchanged shape (no evidence_mode)", "evidence_mode" not in k_pool)
 check("cited key tagged and uses the cited prompt", k_cit["evidence_mode"] == "cited" and k_cit["prompts_sha"] != k_pool["prompts_sha"])
 check("cache file names differ", IG.cache_name("pool") != IG.cache_name("cited"))
+
+print("9. citation attachment by rule")
+REPORT = """## Evidence
+
+- CT this admission: radiology note `16706440-RR-41` is a CTA at `2167-03-27 14:17`. The technique states that contrast was given without complication.
+- Baseline creatinine was 0.5 mg/dL and KDIGO stage 1 applies [policy: kdigo.md L493-L500]. No later value exceeded it during the stay.
+
+The potassium was 7.3 mEq/L (labevents itemid 50971). Insulin was not charted in emar for this admission.
+
+A separate paragraph makes a claim with no source named anywhere in it at all.
+
+| Lab | Value | Source |
+|---|---|---|
+| Lactate | 4.1 | `get_lab_timeline` |
+"""
+U = IG.report_units(REPORT)
+texts = [u["text"] for u in U]
+at = lambda needle: next(i for i, s in enumerate(texts) if needle in s)  # noqa: E731
+check("table separator row is not a unit", not any(set(s) <= set("|-: ") for s in texts), str(texts))
+h, scope = IG.attach_citation(U, at("radiology note"))
+check("own sentence: note id and timestamp", scope == "sentence" and "16706440-RR-41" in h and "2167-03-27 14:17" in h, str((h, scope)))
+h, scope = IG.attach_citation(U, at("The technique states"))
+check("no citation in the sentence → inherits the list item's", scope == "block" and "16706440-RR-41" in h, str((h, scope)))
+h, scope = IG.attach_citation(U, at("Baseline creatinine"))
+check("a policy citation is not a patient-evidence citation", (h, scope) == ([], "none"), str((h, scope)))
+h, scope = IG.attach_citation(U, at("potassium was 7.3"))
+check("parenthetical naming a table is a citation", scope == "sentence" and h == ["labevents itemid 50971"], str((h, scope)))
+h, scope = IG.attach_citation(U, at("Insulin was not charted"))
+check("bare MIMIC table name in running text is a citation", scope == "sentence" and h == ["emar"], str((h, scope)))
+h, scope = IG.attach_citation(U, at("separate paragraph"))
+check("a paragraph break ends the scope", (h, scope) == ([], "none"), str((h, scope)))
+h, scope = IG.attach_citation(U, at("Lactate"))
+check("table row carries its own source cell", scope == "sentence" and h == ["get_lab_timeline"], str((h, scope)))
+check("unit index out of range → no citation", IG.attach_citation(U, -1) == ([], "none") and IG.attach_citation(U, 10**6) == ([], "none"))
+check("an ordinary parenthetical is not a citation", IG.unit_handles("Rhythm was SR (Sinus Rhythm) at 19:00 (and V paced later).") == [])
+check("ICD-9 / CURB-65 / POD-2 are not note ids", IG.unit_handles("ICD-9 431 (CURB-65 of 0) on POD-2.") == []
+      and IG.citation_kind(["ICD-9 431"], CASE) == "descriptor", str(IG.unit_handles("ICD-9 431 (CURB-65 of 0) on POD-2.")))
+check("a short note id still is", IG.unit_handles("Per RR-41 the lung was clear enough.") == ["RR-41"])
+check("pointer kind: record id > tool/table > date", [IG.pointer_kind(x, CASE) for x in (["16706440-RR-41", "2167-03-27"], ["emar"], ["2167-03-27 14:17"], [])] == ["record", "source", "date", "none"])
+check("attachment is deterministic", all(IG.attach_citation(U, i) == IG.attach_citation(IG.report_units(REPORT), i) for i in range(len(U))))
+
+print("10. claims are extracted once and reused")
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_real_call, _n_extract = IG._call, [0]
+
+
+def _extract_stub(client, model, prompt):
+    _n_extract[0] += 1
+    return json.dumps([{"claim": f"draw {_n_extract[0]}", "unit": 2}, {"claim": "bad unit", "unit": "x"}])
+
+
+IG._call = _extract_stub
+with tempfile.TemporaryDirectory() as td:
+    cache = Path(td) / IG.CLAIMS_CACHE_NAME
+    c1 = IG.load_or_extract_claims(None, "m", REPORT, "u", cache)
+    c2 = IG.load_or_extract_claims(None, "m", REPORT, "u", cache)
+    check("second call reads the cache, no new extraction", _n_extract[0] == 1 and c1 == c2, str((_n_extract[0], c1, c2)))
+    check("unit numbers are stored zero-based; unusable ones as -1", [c["unit"] for c in c1] == [1, -1], str(c1))
+    c3 = IG.load_or_extract_claims(None, "m", REPORT + " edited", "u", cache)
+    check("an edited report is re-extracted", _n_extract[0] == 2 and c3 != c1, str(_n_extract[0]))
+IG._call = _real_call
+
+sc = IG.score(
+    [{"claim": "a", "cited": ["x"], "cited_scope": "sentence"}, {"claim": "b", "cited": ["y"], "cited_scope": "block"},
+     {"claim": "c", "cited": [], "cited_scope": "none"}, {"claim": "d", "cited": ["z"], "cited_scope": "sentence"}],
+    [{"verdict": "supported", "citation_kind": "pointer"}, {"verdict": "unverifiable", "citation_kind": "pointer"},
+     {"verdict": "unresolvable", "citation_kind": "none"}, {"verdict": "unresolved", "citation_kind": "pointer"}], mode="cited")
+check("coverage counts every claim with a citation, matched or not", abs(sc["coverage"] - 0.75) < 1e-9, str(sc["coverage"]))
+check("citation precision is over cited claims only", abs(sc["citation_precision"] - 1 / 3) < 1e-9, str(sc["citation_precision"]))
+check("sentence-only pair", abs(sc["coverage_sentence"] - 0.5) < 1e-9 and abs(sc["citation_precision_sentence"] - 0.5) < 1e-9, str(sc))
 
 print()
 if _fails:
