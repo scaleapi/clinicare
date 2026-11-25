@@ -204,6 +204,7 @@ _SOURCE_WORDS = {
     "edstays": {"edstays"}, "ed visit": {"edstays"},
 }
 _TOOL_IN_HANDLE = re.compile(r"(get_[a-z_]+|list_[a-z_]+|search_notes|run_sql)")
+_SQL_WORD = re.compile(r"(?<![a-z_])sql(?![a-z_])")
 _LONG_ID = re.compile(r"\d{6,}(?:-[A-Z]{1,4}-\d+|-\d+)?")           # 12014968, 12014968-RR-9, 10001217-107
 # RR-9 / DS-21 without the subject prefix. Only the note types MIMIC-IV-Note has (discharge
 # summary, radiology report, radiology addendum): a looser [A-Z]{1,4}-\d+ also matches ICD-9,
@@ -222,9 +223,12 @@ def _handle_probes(hl: str) -> list[tuple[str, str]]:
     `discharge narrative` yields ('table', 'discharge'). Nothing recognised → []."""
     probes: list[tuple[str, str]] = []
     low = hl.lower()
-    m = _TOOL_IN_HANDLE.search(low)
-    if m and m.group(1) in MIMIC_TOOLS:
-        probes.append(("tool", m.group(1)))
+    # Every tool the handle names: `get_admission_details`, `run_sql` on `chartevents`,
+    # `get_vitals_timeline` cites three calls, not the first one. "SQL" / "raw SQL" is run_sql.
+    tools = [m.group(1) for m in _TOOL_IN_HANDLE.finditer(low) if m.group(1) in MIMIC_TOOLS]
+    if _SQL_WORD.search(low) and "run_sql" not in tools:
+        tools.append("run_sql")
+    probes.extend(("tool", t) for t in dict.fromkeys(tools))
     for m in _LONG_ID.finditer(hl):
         probes.append(("id", m.group(0)))
     for m in _SHORT_NOTE.finditer(hl):
@@ -293,25 +297,30 @@ def resolve_citations(
     case_ids = set().union(*case.values()) if case else set()
     used, dropped, hits = [], [], set()
     for h in cited:
-        hl = h.strip().strip("`*_[]()")
-        kv = re.match(r"^\s*[A-Za-z_]+\s*[:=]\s*(.+?)\s*$", hl)
-        if kv and not _TOOL_IN_HANDLE.search(hl.lower()):
-            hl = kv.group(1).strip("`*_[]()\"'")
-        probes = [(k, v) for k, v in _handle_probes(hl) if not (k == "id" and v in case_ids)]
-        if not hl or hl in case_ids or not probes:
-            dropped.append(h)
-            continue
-        # A handle resolves through its MOST SPECIFIC probe tier only: a record id if it has one,
-        # else a timestamp, else a tool, else a table / source word. `radiology report
-        # 12014968-RR-99` therefore stands or falls on RR-99; the words "radiology report" do not
-        # widen it to every radiology row, which would credit a citation to a note never retrieved.
+        # One parenthesis often cites several sources separated by ";" — (ordered 08:48,
+        # `list_orders`; result transcribed in DS-11) — and each is a citation of its own. Resolved
+        # as one handle, the note id would win the tier below and the order row would never reach
+        # the judge. Each part is resolved separately and the handle gets their union.
         found: set[int] = set()
-        for tier in (("id", "note"), ("ts", "md", "time"), ("tool",), ("table",)):
-            tier_probes = [(k, v) for k, v in probes if k in tier]
-            if tier_probes:
-                for k, v in tier_probes:
-                    found |= _probe_hits(k, v, observations)
-                break
+        for part in h.split(";"):
+            hl = part.strip().strip("`*_[]()")
+            kv = re.match(r"^\s*[A-Za-z_]+\s*[:=]\s*(.+?)\s*$", hl)
+            if kv and not _TOOL_IN_HANDLE.search(hl.lower()):
+                hl = kv.group(1).strip("`*_[]()\"'")
+            probes = [(k, v) for k, v in _handle_probes(hl) if not (k == "id" and v in case_ids)]
+            if not hl or hl in case_ids or not probes:
+                continue
+            # A part resolves through its MOST SPECIFIC probe tier only: a record id if it has
+            # one, else a timestamp, else the tools it names, else a table / source word.
+            # `radiology report 12014968-RR-99` therefore stands or falls on RR-99; the words
+            # "radiology report" do not widen it to every radiology row, which would credit a
+            # citation to a note never retrieved.
+            for tier in (("id", "note"), ("ts", "md", "time"), ("tool",), ("table",)):
+                tier_probes = [(k, v) for k, v in probes if k in tier]
+                if tier_probes:
+                    for k, v in tier_probes:
+                        found |= _probe_hits(k, v, observations)
+                    break
         (used if found else dropped).append(h)
         hits |= found
     # Follow code-mode calls to their rows.
@@ -389,7 +398,8 @@ def citation_kind(cited: list[str], case: dict[str, set[str]]) -> str:
 # name, a record id, or a full date. Policy citations ([policy: file.md L1-L9]) are not
 # patient-evidence citations and are skipped.
 UNITS_VERSION = 1    # segmentation into units; part of the claims cache key
-ATTACH_VERSION = 2   # which citation a unit gets (2: nested list items inherit the parent item)
+ATTACH_VERSION = 3   # which citation a unit gets (2: nested list items inherit the parent item;
+                     # 3: a parenthesis cut by the sentence splitter is read whole)
 
 _LIST_ITEM = re.compile(r"^\s*([-*+•]|\d+[.)])\s+")
 _ABBREV_END = re.compile(r"\b(?:e\.g|i\.e|vs|Dr|No|approx|Fig|cf|etc|al|incl|est|min|max|hr|hrs)\.$", re.I)
@@ -517,20 +527,57 @@ def unit_handles(text: str) -> list[str]:
     return list(dict.fromkeys(handles))
 
 
+_PAREN_RUN_MAX = 3
+
+
+def _depth_after(text: str, depth: int = 0) -> int:
+    """Open ( and [ left unclosed at the end of `text`, starting from `depth`."""
+    for ch in text:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+    return depth
+
+
+def sentence_run(units: list[dict], i: int) -> list[int]:
+    """Units that make up the sentence unit `i` belongs to. The splitter cuts at ";" and "."
+    even inside a parenthesis, so `… PE result (`get_imaging_studies`; `get_note` on
+    `15991401-RR-13`).` arrives as two units and the note citation is lost to the claim in the
+    first. When a parenthesis or bracket opened in a unit is closed within the next
+    _PAREN_RUN_MAX units of the same block, those units are one sentence. An opening that is
+    never closed (a stray "(") joins nothing."""
+    b = units[i]["block"]
+    for s in range(max(0, i - _PAREN_RUN_MAX), i + 1):
+        if units[s]["block"] != b:
+            continue
+        d, e = _depth_after(units[s]["text"]), s
+        while d > 0 and e + 1 < len(units) and units[e + 1]["block"] == b and e + 1 - s <= _PAREN_RUN_MAX:
+            e += 1
+            d = _depth_after(units[e]["text"], d)
+        if d == 0 and s <= i <= e and e > s:
+            return list(range(s, e + 1))
+    return [i]
+
+
 def attach_citation(units: list[dict], i: int) -> tuple[list[str], str]:
-    """(handles, scope) for a claim taken from unit `i`: the unit's own handles ("sentence"), else
-    the handles of its block ("block"), else those of the list item it is nested under
-    ("parent"), else ([], "none")."""
+    """(handles, scope) for a claim taken from unit `i`: the handles of its own sentence
+    ("sentence"), else the handles of its block ("block"), else those of the list item it is
+    nested under ("parent"), else ([], "none")."""
     if not 0 <= i < len(units):
         return [], "none"
-    own = unit_handles(units[i]["text"])
+    own = unit_handles(" ".join(units[k]["text"] for k in sentence_run(units, i)))
     if own:
         return own, "sentence"
     def block_handles(b: int) -> list[str]:
+        # Sentence by sentence, so a parenthesis the splitter cut is seen entire.
         hs: list[str] = []
-        for u in units:
-            if u["block"] == b:
-                hs += unit_handles(u["text"])
+        done: set[int] = set()
+        for k, u in enumerate(units):
+            if u["block"] == b and k not in done:
+                run = sentence_run(units, k)
+                done.update(run)
+                hs += unit_handles(" ".join(units[j]["text"] for j in run))
         return list(dict.fromkeys(hs))
 
     block = block_handles(units[i]["block"])
@@ -943,7 +990,7 @@ SCORER_VERSION = 2
 # Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
 # judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
 # the cache; the version is part of the cited cache key.
-RESOLVER_VERSION = 8
+RESOLVER_VERSION = 9
 
 
 def _sha(*parts: str) -> str:

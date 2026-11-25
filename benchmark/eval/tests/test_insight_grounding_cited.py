@@ -22,6 +22,8 @@ statement about WHICH EVIDENCE reached the judge, which is the thing under dispu
  9b. a nested list item inherits the citation of the item it sits under.
  9c. the judge is shown the tool call and arguments (e.g. the SQL) with each cited record.
  9d. a code-mode call whose rows arrive in a later output resolves to that output.
+ 9f. a citation naming several sources resolves to all of them, and a parenthesis cut by the
+     sentence splitter is read whole.
  9e. uncertain attachments (paragraph / parent scope, table rows, phrase-only handles) are
      re-audited per handle by the judge model; direct sentence citations are left to the rule.
  10. claims are extracted once per report and reused, so re-judging scores the same claims.
@@ -313,6 +315,40 @@ check("…and is scored as having no citation, not as a wrong one", v[0]["verdic
 c_un = [{"claim": "x", "unit": ai("drain was placed"), "cited": ["16706440-RR-41"], "cited_scope": "block"}]
 IG.apply_audit(c_un, AUD, {})
 check("no answer from the model leaves the rule's citation in place", c_un[0]["audit"] == "unanswered" and c_un[0]["cited"] == ["16706440-RR-41"])
+
+print("9f. a citation that names several sources resolves to each of them")
+MULTI = [
+    Observation(step_id=1, tool="list_orders", args={"subject_id": 15167397}, text='{"ordertime": "2172-01-29 08:48:32", "order_subtype": "Nuclear Med"}'),
+    Observation(step_id=2, tool="get_note", args={"note_id": "15167397-DS-11"}, text='{"note_id": "15167397-DS-11", "text": "HIDA scan: patent common bile duct"}'),
+    Observation(step_id=3, tool="get_imaging_studies", args={"subject_id": 15167397}, text='{"items": []}'),
+    Observation(step_id=4, tool="get_data_availability", args={"subject_id": 15167397}, text='{"stream": "radiology_notes", "rows": 0}'),
+    Observation(step_id=5, tool="run_sql", args={"query": "SELECT note_id FROM radiology_notes WHERE subject_id=15167397"}, text='{"rows": []}'),
+    Observation(step_id=6, tool="get_lab_timeline", args={"subject_id": 15167397}, text='{"charttime": "2172-02-02 05:00:00", "lab_name": "Lactate"}'),
+]
+idx, used, dropped = IG.resolve_citations(["ordered 2172-01-29 08:48, `list_orders`; result transcribed in DS-11"], MULTI, CASE)
+check("';' separates two citations: the order row and the note both reach the judge", idx == [0, 1], str(idx))
+idx, _, _ = IG.resolve_citations(["radiology report 15167397-DS-11"], MULTI, CASE)
+check("within one part the most specific tier still decides (note id, not every radiology row)", idx == [1], str(idx))
+idx, _, _ = IG.resolve_citations(["`get_imaging_studies`, `get_data_availability`, direct SQL on `radiology_notes`"], MULTI, CASE)
+check("every tool named is resolved, and 'SQL' is run_sql", idx == [2, 3, 4], str(idx))
+idx, _, _ = IG.resolve_citations(["mimic_get_imaging_studies; mimic_get_lab_timeline"], MULTI, CASE)
+check("two tools separated by ';'", idx == [2, 5], str(idx))
+
+CUT = (
+    "- No PE-directed testing is documented. That report's findings were cardiomegaly and mild fluid overload, "
+    "with no PE-directed imaging or PE result (`get_imaging_studies`; `get_note` on `15991401-RR-13`). "
+    "A later paragraph sentence stands alone without any source at all.\n"
+)
+units = IG.report_units(CUT)
+cut_i = next(k for k, u in enumerate(units) if "cardiomegaly" in u["text"])
+check("the splitter cuts the parenthesis at ';' (the case this guards)", "RR-13" not in units[cut_i]["text"], units[cut_i]["text"])
+check("the cut unit and its continuation are one sentence", IG.sentence_run(units, cut_i) == [cut_i, cut_i + 1], str(IG.sentence_run(units, cut_i)))
+hs, scope = IG.attach_citation(units, cut_i)
+check("the claim gets the whole parenthesis, at sentence scope",
+      scope == "sentence" and any("RR-13" in h and "get_imaging_studies" in h for h in hs), f"{scope} {hs}")
+STRAY = "- Dose given 1) at 08:00 and 2) at 10:00 (see below. Next sentence is long enough to stand alone here. And a third sentence with `get_note` in it.\n"
+su = IG.report_units(STRAY)
+check("a parenthesis that never closes joins nothing", IG.sentence_run(su, 0) == [0], str(IG.sentence_run(su, 0)))
 
 print("10. claims are extracted once and reused")
 import tempfile  # noqa: E402

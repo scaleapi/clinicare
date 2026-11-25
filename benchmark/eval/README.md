@@ -176,6 +176,9 @@ python $G/insight_grounding_llm.py --traces <traces> --limit 3 --verbose
 #                     The judge sees each cited record with the tool call and arguments that
 #                     produced it; a code-mode call whose rows arrive in a later output is
 #                     linked to that output.
+#                     A citation that names several sources, `(tool; note id)` or
+#                     `tool_a, tool_b`, resolves to each of them, and a parenthesis the
+#                     sentence splitter cut at ";" is read whole.
 #    --trials-from F  grade only the trial dirs listed in F (see sample_reports.py)
 python $G/insight_grounding_llm.py --traces <traces> --evidence cited --trials-from sample.txt
 #    Paired sample + per-system table (citation coverage / citation precision, same cases for
