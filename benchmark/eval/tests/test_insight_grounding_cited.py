@@ -19,6 +19,9 @@ statement about WHICH EVIDENCE reached the judge, which is the thing under dispu
   9. which citation belongs to a claim is decided by rule: the claim's own sentence, else the rest
      of its paragraph / list item / table row; policy citations and the case's own ids are not
      patient-evidence citations; a paragraph break ends the scope.
+ 9b. a nested list item inherits the citation of the item it sits under.
+ 9c. the judge is shown the tool call and arguments (e.g. the SQL) with each cited record.
+ 9d. a code-mode call whose rows arrive in a later output resolves to that output.
  10. claims are extracted once per report and reused, so re-judging scores the same claims.
 
     python benchmark/eval/tests/test_insight_grounding_cited.py
@@ -225,6 +228,50 @@ check("ICD-9 / CURB-65 / POD-2 are not note ids", IG.unit_handles("ICD-9 431 (CU
 check("a short note id still is", IG.unit_handles("Per RR-41 the lung was clear enough.") == ["RR-41"])
 check("pointer kind: record id > tool/table > date", [IG.pointer_kind(x, CASE) for x in (["16706440-RR-41", "2167-03-27"], ["emar"], ["2167-03-27 14:17"], [])] == ["record", "source", "date", "none"])
 check("attachment is deterministic", all(IG.attach_citation(U, i) == IG.attach_citation(IG.report_units(REPORT), i) for i in range(len(U))))
+
+print("9b. nested list items inherit the parent item's citation; siblings and headings do not")
+NESTED = """### Imaging
+
+1. **CT Chest with Contrast** (Note: `14563230-RR-28`):
+   - **Timestamp**: `2132-03-17 12:11:00`
+   - **Location**: Transplant Floor on the general ward
+2. **Abdominal ultrasound** with no source named for it
+   - **Location**: Radiology suite on the second floor
+
+- **Administration Window**: 07:45 to 08:45 (stay_id 32008189, ICU)
+- **Clinical Course**: persistent bleeding via chest tubes overnight
+"""
+N = IG.report_units(NESTED)
+nt = [u["text"] for u in N]
+nat = lambda needle: next(i for i, s in enumerate(nt) if needle in s)  # noqa: E731
+h, scope = IG.attach_citation(N, nat("Transplant Floor"))
+check("sub-bullet with no citation takes the parent item's note id", scope == "parent" and len(h) == 1 and "14563230-RR-28" in h[0], str((h, scope)))
+h, scope = IG.attach_citation(N, nat("Timestamp"))
+check("sub-bullet with its own citation keeps it", scope == "sentence" and h == ["2132-03-17 12:11:00"], str((h, scope)))
+h, scope = IG.attach_citation(N, nat("Radiology suite"))
+check("parent without a citation gives none; the earlier item is not inherited", (h, scope) == ([], "none"), str((h, scope)))
+h, scope = IG.attach_citation(N, nat("Clinical Course"))
+check("a sibling bullet's citation is not inherited", (h, scope) == ([], "none"), str((h, scope)))
+
+print("9c. the judge sees which call produced a cited record")
+SQL = Observation(step_id=4, tool="run_sql", args={"query": "SELECT COUNT(*) FROM procedureevents WHERE hadm_id = 1"},
+                  text='{"rows": [{"count_star()": 0}]}')
+_seen_prompts.clear()
+IG.judge_cited(None, "m", [{"claim": "value procedureevents empty", "cited": ["run_sql"]}], [SQL], CASE)
+check("the SQL text reaches the judge with its result", "FROM procedureevents" in _seen_prompts[-1] and "count_star" in _seen_prompts[-1], _seen_prompts[-1][-300:])
+
+print("9d. an async exec call resolves to the later output that carries its rows")
+ASYNC = [
+    Observation(step_id=11, tool="get_ed_visit_details", args={"stay_id": 30252376}, text=""),
+    Observation(step_id=11, tool=IG.EXEC_OUTPUT_TOOL, args={}, text="Script running with cell ID 5\nWall time 10.0 seconds\nOutput:\n"),
+    Observation(step_id=12, tool=IG.EXEC_OUTPUT_TOOL, args={}, text="Script completed\nOutput:\n{\"triage\": {\"resprate\": 22}}"),
+    Observation(step_id=13, tool=IG.EXEC_OUTPUT_TOOL, args={}, text="Script completed\nOutput:\nunrelated later cell"),
+]
+idx, used, dropped = IG.resolve_citations(["get_ed_visit_details"], ASYNC, CASE)
+check("stub plus the completing output, not the cell after it", idx == [0, 1, 2], str(idx))
+SYNC = [ASYNC[0], Observation(step_id=11, tool=IG.EXEC_OUTPUT_TOOL, args={}, text="Script completed\nOutput:\nrows"), ASYNC[3]]
+idx, _, _ = IG.resolve_citations(["get_ed_visit_details"], SYNC, CASE)
+check("a sync call still resolves to its own step's output only", idx == [0, 1], str(idx))
 
 print("10. claims are extracted once and reused")
 import tempfile  # noqa: E402

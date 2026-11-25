@@ -319,9 +319,35 @@ def resolve_citations(
     for i in sorted(hits):
         o = observations[i]
         if o.tool != EXEC_OUTPUT_TOOL and not (o.text or "").strip():
-            same_step = [j for j in exec_idx if observations[j].step_id == o.step_id]
-            hits |= set(same_step or exec_idx)
+            hits |= set(_call_outputs(i, observations, exec_idx))
     return sorted(hits), used, dropped
+
+
+_EXEC_PENDING = re.compile(r"Script running with cell ID")
+_EXEC_DONE = re.compile(r"Script completed")
+
+
+def _call_outputs(i: int, observations: list, exec_idx: list[int]) -> list[int]:
+    """Exec outputs that carry the rows of the code-mode call at index `i`.
+
+    Sync script: the exec output of the same step. Async script: the same-step output is only
+    the stub "Script running with cell ID N" and the rows arrive in a later `wait` output, so
+    the stub is kept (it is what the agent saw) and the outputs that follow are added up to and
+    including the first one that reports "Script completed". When the step has no exec output
+    at all the call cannot be placed, and every exec output is returned, as before."""
+    step = observations[i].step_id
+    same = [j for j in exec_idx if observations[j].step_id == step]
+    if not same:
+        return exec_idx
+    if not all(_EXEC_PENDING.search(observations[j].text or "") for j in same):
+        return same
+    out = list(same)
+    for j in exec_idx:
+        if j > max(same):
+            out.append(j)
+            if _EXEC_DONE.search(observations[j].text or ""):
+                break
+    return out
 
 
 def citation_kind(cited: list[str], case: dict[str, set[str]]) -> str:
@@ -353,15 +379,17 @@ def citation_kind(cited: list[str], case: dict[str, set[str]]) -> str:
 # The rule. The report is cut into units: a sentence of running text, a list item's sentences, or
 # one table row. A claim's citation is every citation handle in its own unit; when its unit has
 # none, every handle in the rest of the same block (paragraph, list item or table row), because
-# reports routinely name the note or tool once at the head of a bullet and then describe it. The
-# scope that supplied the citation is recorded per claim ("sentence" / "block" / "none"), so the
+# reports routinely name the note or tool once at the head of a bullet and then describe it; when
+# the block has none either, the handles of the list item it is nested under. The scope that
+# supplied the citation is recorded per claim ("sentence" / "block" / "parent" / "none"), so the
 # stricter sentence-only reading can be computed from the same output.
 #
 # A citation handle is (1) a backtick, bracket or parenthetical span that names a tool, a table or
 # source type, a record id, or a full date; (2) outside such spans, a tool name, a MIMIC table
 # name, a record id, or a full date. Policy citations ([policy: file.md L1-L9]) are not
 # patient-evidence citations and are skipped.
-UNITS_VERSION = 1
+UNITS_VERSION = 1    # segmentation into units; part of the claims cache key
+ATTACH_VERSION = 2   # which citation a unit gets (2: nested list items inherit the parent item)
 
 _LIST_ITEM = re.compile(r"^\s*([-*+•]|\d+[.)])\s+")
 _ABBREV_END = re.compile(r"\b(?:e\.g|i\.e|vs|Dr|No|approx|Fig|cf|etc|al|incl|est|min|max|hr|hrs)\.$", re.I)
@@ -370,16 +398,27 @@ _CITATION_ONLY = re.compile(r"^\s*(?:(?:\[[^\]]*\]|\([^)]*\)|`[^`]*`)[\s,;.]*)+$
 _MIN_SENTENCE = 25
 
 
-def report_blocks(report: str) -> list[str]:
-    """Blocks of a markdown report: a heading, a table row, a list item (with its continuation
-    lines), or a paragraph. Blank lines, rules and table separator rows end a block."""
-    out: list[str] = []
+def _indent(line: str) -> int:
+    return len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
+
+
+def _blocks(report: str) -> list[tuple[str, int | None]]:
+    """(text, parent) per block. A block is a heading, a table row, a list item (with its
+    continuation lines), or a paragraph; blank lines, rules and table separator rows end a block.
+    `parent` is the index of the list item a nested list item (or an indented paragraph inside a
+    list) sits under, else None. Headings, table rows and unindented paragraphs end the list."""
+    out: list[tuple[str, int | None]] = []
     cur: list[str] = []
+    cur_parent: list[int | None] = [None]
+    stack: list[tuple[int, int]] = []          # (indent, block index) of the open list items
 
     def flush() -> None:
         if cur:
-            out.append(" ".join(s.strip() for s in cur))
+            out.append((" ".join(s.strip() for s in cur), cur_parent[0]))
             cur.clear()
+
+    def parent_for(indent: int) -> int | None:
+        return next((b for ind, b in reversed(stack) if ind < indent), None)
 
     for line in report.splitlines():
         s = line.strip()
@@ -387,17 +426,35 @@ def report_blocks(report: str) -> list[str]:
             flush()
         elif s.startswith("#"):
             flush()
-            out.append(s)
+            stack.clear()
+            out.append((s, None))
         elif s.startswith("|"):
             flush()
+            stack.clear()
             if not re.fullmatch(r"[|\s:-]+", s):
-                out.append(s)
+                out.append((s, None))
+        elif _LIST_ITEM.match(line):
+            flush()
+            ind = _indent(line)
+            while stack and stack[-1][0] >= ind:
+                stack.pop()
+            cur_parent[0] = stack[-1][1] if stack else None
+            stack.append((ind, len(out)))       # this item becomes block len(out) at flush
+            cur.append(line)
         else:
-            if _LIST_ITEM.match(line):
-                flush()
+            if not cur:                         # a new paragraph
+                ind = _indent(line)
+                if ind == 0:
+                    stack.clear()
+                cur_parent[0] = parent_for(ind) if ind else None
             cur.append(line)
     flush()
     return out
+
+
+def report_blocks(report: str) -> list[str]:
+    """Block texts of a markdown report (see _blocks)."""
+    return [text for text, _ in _blocks(report)]
 
 
 def report_units(report: str) -> list[dict]:
@@ -406,9 +463,9 @@ def report_units(report: str) -> list[dict]:
     ending in an abbreviation is joined to what follows, and a fragment that is only a citation
     is joined to the sentence before it."""
     units: list[dict] = []
-    for b, text in enumerate(report_blocks(report)):
+    for b, (text, parent) in enumerate(_blocks(report)):
         if text.startswith("|") or text.startswith("#"):
-            units.append({"block": b, "text": text})
+            units.append({"block": b, "text": text, "parent": parent})
             continue
         parts: list[str] = []
         buf = ""
@@ -429,7 +486,7 @@ def report_units(report: str) -> list[dict]:
                 merged[-1] = f"{merged[-1]} {part}"
             else:
                 merged.append(part)
-        units.extend({"block": b, "text": part} for part in merged)
+        units.extend({"block": b, "text": part, "parent": parent} for part in merged)
     return units
 
 
@@ -462,18 +519,34 @@ def unit_handles(text: str) -> list[str]:
 
 def attach_citation(units: list[dict], i: int) -> tuple[list[str], str]:
     """(handles, scope) for a claim taken from unit `i`: the unit's own handles ("sentence"), else
-    the handles of the other units of its block ("block"), else ([], "none")."""
+    the handles of its block ("block"), else those of the list item it is nested under
+    ("parent"), else ([], "none")."""
     if not 0 <= i < len(units):
         return [], "none"
     own = unit_handles(units[i]["text"])
     if own:
         return own, "sentence"
-    block: list[str] = []
-    for u in units:
-        if u["block"] == units[i]["block"]:
-            block += unit_handles(u["text"])
-    block = list(dict.fromkeys(block))
-    return (block, "block") if block else ([], "none")
+    def block_handles(b: int) -> list[str]:
+        hs: list[str] = []
+        for u in units:
+            if u["block"] == b:
+                hs += unit_handles(u["text"])
+        return list(dict.fromkeys(hs))
+
+    block = block_handles(units[i]["block"])
+    if block:
+        return block, "block"
+    # A nested list item under "1. CT chest (note `…-RR-28`):" is about that note: walk up the
+    # enclosing list items, nearest first. Siblings and headings are not inherited.
+    parent_of = {u["block"]: u.get("parent") for u in units}
+    b, seen = parent_of.get(units[i]["block"]), set()
+    while b is not None and b not in seen:
+        seen.add(b)
+        hs = block_handles(b)
+        if hs:
+            return hs, "parent"
+        b = parent_of.get(b)
+    return [], "none"
 
 
 def pointer_kind(cited: list[str], case: dict[str, set[str]]) -> str:
@@ -672,6 +745,26 @@ def score(claims: list[str], verdicts: list[dict], mode: str = "pool") -> dict:
     return out
 
 
+_ARGS_MAX = 2000
+
+
+def _evidence_block(obs) -> str:
+    """One cited observation as the judge sees it: a header naming the tool call and its
+    arguments, then the returned text. Without the header a result such as `COUNT(*) = 0`, or
+    a medication list filtered to five drug names, cannot be read: the claim "procedureevents
+    was empty" is supported by the row only together with the query that produced it. Raw
+    command output (code mode) has no call of its own and gets a plain header."""
+    if obs.tool == EXEC_OUTPUT_TOOL:
+        head = "### output"
+    else:
+        args = json.dumps(obs.args, default=str, sort_keys=True) if obs.args else "{}"
+        if len(args) > _ARGS_MAX:
+            args = args[:_ARGS_MAX] + " …"
+        head = f"### call {obs.tool} {args}"
+    body = (obs.text or "").strip()
+    return f"{head}\n{body}" if body else f"{head}\n(rows are in the output that follows)"
+
+
 def judge_cited(client, model: str, claims: list[dict], observations: list, case: dict) -> list[dict]:
     """Cited mode: each claim is judged against ONLY the observations its citation handles
     resolve to. Claims sharing the same resolved set are batched into one judge call. The
@@ -693,7 +786,7 @@ def judge_cited(client, model: str, claims: list[dict], observations: list, case
         else:
             groups.setdefault(tuple(idx), []).append(k)
     for idx, ks in groups.items():
-        evidence = "\n".join(observations[i].text for i in idx if observations[i].text)
+        evidence = "\n\n".join(_evidence_block(observations[i]) for i in idx)
         graded = judge_claims(client, model, [claims[k]["claim"] for k in ks], evidence)
         for k, g in zip(ks, graded):
             meta[k].update({"verdict": g.get("verdict", "unverifiable"), "reason": g.get("reason", "")})
@@ -713,7 +806,7 @@ SCORER_VERSION = 2
 # Cited mode only: bump when resolve_citations() changes. The resolver decides which rows the
 # judge sees, so a resolver change alters verdicts with no prompt or input change to invalidate
 # the cache; the version is part of the cited cache key.
-RESOLVER_VERSION = 7
+RESOLVER_VERSION = 8
 
 
 def _sha(*parts: str) -> str:
@@ -766,7 +859,7 @@ def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mod
         # the case ids, none of which the flattened pool text captures; `structure` is their
         # serialisation (see cited_structure), so a corrected trace re-grades.
         **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION, "units_version": UNITS_VERSION,
-            "structure_sha": _sha(structure)}
+            "attach_version": ATTACH_VERSION, "structure_sha": _sha(structure)}
            if mode != "pool" else {}),
     }
 

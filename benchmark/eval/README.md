@@ -165,10 +165,14 @@ python $G/insight_grounding_llm.py --traces <traces> --limit 3 --verbose
 #                     Which citation belongs to a claim is decided by rule, not by the model: the
 #                     report is cut into numbered sentences, the model says which sentence each
 #                     claim came from, and the citation is read off that sentence, else off the
-#                     rest of its paragraph / list item / table row (cited_scope per claim;
+#                     rest of its paragraph / list item / table row, else off the list item
+#                     it is nested under (cited_scope per claim;
 #                     coverage_sentence / citation_precision_sentence are the sentence-only
 #                     reading). Claims are extracted once per report (insight_claims_units.json)
 #                     and reused, so re-judging scores the same claims.
+#                     The judge sees each cited record with the tool call and arguments that
+#                     produced it; a code-mode call whose rows arrive in a later output is
+#                     linked to that output.
 #    --trials-from F  grade only the trial dirs listed in F (see sample_reports.py)
 python $G/insight_grounding_llm.py --traces <traces> --evidence cited --trials-from sample.txt
 #    Paired sample + per-system table (citation coverage / citation precision, same cases for
