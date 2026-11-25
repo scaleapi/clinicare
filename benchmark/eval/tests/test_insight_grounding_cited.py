@@ -22,6 +22,8 @@ statement about WHICH EVIDENCE reached the judge, which is the thing under dispu
  9b. a nested list item inherits the citation of the item it sits under.
  9c. the judge is shown the tool call and arguments (e.g. the SQL) with each cited record.
  9d. a code-mode call whose rows arrive in a later output resolves to that output.
+ 9e. uncertain attachments (paragraph / parent scope, table rows, phrase-only handles) are
+     re-audited per handle by the judge model; direct sentence citations are left to the rule.
  10. claims are extracted once per report and reused, so re-judging scores the same claims.
 
     python benchmark/eval/tests/test_insight_grounding_cited.py
@@ -272,6 +274,45 @@ check("stub plus the completing output, not the cell after it", idx == [0, 1, 2]
 SYNC = [ASYNC[0], Observation(step_id=11, tool=IG.EXEC_OUTPUT_TOOL, args={}, text="Script completed\nOutput:\nrows"), ASYNC[3]]
 idx, _, _ = IG.resolve_citations(["get_ed_visit_details"], SYNC, CASE)
 check("a sync call still resolves to its own step's output only", idx == [0, 1], str(idx))
+
+print("9e. uncertain attachments are re-audited per handle; direct ones are left to the rule")
+ROW = "| 9 | UA with culture | UA at 2147-11-11 18:56:00 showed RBC-6. Urine culture NO GROWTH [microbiologyevents]. |"
+AUD = IG.report_units("Potassium was 7.3 (labevents itemid 50971).\n\n" + ROW + "\n\n- Per `16706440-RR-41` the lung was clear. The drain was placed as planned.\n")
+ai = lambda needle: next(i for i, u in enumerate(AUD) if needle in u["text"])  # noqa: E731
+aclaims = [{"claim": "K was 7.3", "unit": ai("Potassium")}, {"claim": "UA showed RBC-6", "unit": ai("RBC-6")},
+           {"claim": "The drain was placed as planned", "unit": ai("drain was placed")}, {"claim": "uncited", "unit": -1}]
+for c in aclaims:
+    c["cited"], c["cited_scope"] = IG.attach_citation(AUD, c["unit"])
+check("direct sentence citation is not uncertain", not IG.audit_needed(aclaims[0], AUD))
+check("table row and paragraph fallback are uncertain", IG.audit_needed(aclaims[1], AUD) and IG.audit_needed(aclaims[2], AUD))
+check("an uncited claim is never audited", not IG.audit_needed(aclaims[3], AUD))
+check("a phrase naming a source type is uncertain", IG.audit_needed({"cited": ["only 1 discharge note and 7 radiology notes"], "cited_scope": "sentence", "unit": ai("Potassium")}, AUD))
+_real_call2 = IG._call
+_audit_prompts: list[str] = []
+
+
+def _audit_stub(client, model, prompt):
+    _audit_prompts.append(prompt)
+    # claim 1 (the UA): keep the timestamp handle only; claim 2 (the drain): keep nothing
+    ua_handles = aclaims[1]["cited"]
+    ts = next(j for j, h in enumerate(ua_handles, 1) if h.startswith("2147"))
+    return json.dumps([{"i": 1, "keep": [ts], "reason": "time of the UA"}, {"i": 2, "keep": [], "reason": "belongs to the lung finding"}])
+
+
+IG._call = _audit_stub
+keep = IG.audit_citations(None, "m", aclaims, AUD)
+IG._call = _real_call2
+check("only the uncertain claims were sent", "K was 7.3" not in _audit_prompts[-1] and "UA showed RBC-6" in _audit_prompts[-1] and "drain was placed" in _audit_prompts[-1])
+IG.apply_audit(aclaims, AUD, keep)
+check("direct claim untouched", aclaims[0]["audit"] == "direct" and aclaims[0]["cited"] == aclaims[0]["cited_rule"], str(aclaims[0]))
+check("per-handle: the UA keeps its timestamp and loses the culture's table", aclaims[1]["audit"] == "partial" and aclaims[1]["cited"] == ["2147-11-11 18:56"]
+      and "microbiologyevents" in aclaims[1]["cited_rule"], str(aclaims[1]))
+check("a claim whose handles all belong elsewhere becomes uncited", aclaims[2]["audit"] == "dropped" and aclaims[2]["cited"] == [] and aclaims[2]["cited_rule"], str(aclaims[2]))
+v = IG.judge_cited(None, "m", [aclaims[2]], OBS4, CASE)
+check("…and is scored as having no citation, not as a wrong one", v[0]["verdict"] == "unresolvable" and v[0]["citation_kind"] == "none", str(v))
+c_un = [{"claim": "x", "unit": ai("drain was placed"), "cited": ["16706440-RR-41"], "cited_scope": "block"}]
+IG.apply_audit(c_un, AUD, {})
+check("no answer from the model leaves the rule's citation in place", c_un[0]["audit"] == "unanswered" and c_un[0]["cited"] == ["16706440-RR-41"])
 
 print("10. claims are extracted once and reused")
 import tempfile  # noqa: E402

@@ -591,6 +591,143 @@ def extract_claims_units(client, model: str, units: list[dict]) -> list[dict]:
     return out
 
 
+# ── (1c) re-audit of uncertain attachments ─────────────────────────────────────────────────
+# The rule above is deliberately simple, and reading claims against the reports showed where it
+# over-attaches: a wide table row whose one source belongs to another fact in the row, a paragraph
+# whose only citation belongs to an earlier sentence, a parenthetical or quoted string that merely
+# contains a source word. Those cases are identifiable by rule, so the rule's answer is kept
+# wherever it is direct and the judge model is asked a narrow question only where it is not.
+#
+# A claim is UNCERTAIN, by rule and regardless of how it will be judged, when its citation came
+# from the rest of its paragraph or from an enclosing list item (scope "block" / "parent"), when
+# it was taken from a table row, or when one of its handles is only a phrase naming a source type.
+# For each such claim the model is shown the claim, its context and the numbered handles, and
+# returns the handles the report presents as the source of THAT claim. Handles it does not return
+# are dropped; a claim left with none is uncited. The question is asked per handle, so a row that
+# gives a fact its own timestamp and another fact a table name keeps the timestamp.
+#
+# On a 120-claim check asked twice the answers agreed on every claim. Decisions are cached per
+# report next to the claims, so re-judging reuses them.
+AUDIT_VERSION = 1
+AUDIT_CACHE_NAME = "insight_citation_audit.json"
+_AUDIT_BATCH = int(os.environ.get("IG_AUDIT_BATCH", "10"))
+_AUDIT_CONTEXT_CHARS = 3000
+
+_AUDIT_PROMPT = """A clinical audit report makes the numbered CLAIMS below. For each claim, a rule collected the \
+citation HANDLES found in the claim's sentence, table row, paragraph or enclosing list item (its CONTEXT). \
+Some of those handles belong to the claim and some belong to a different fact in the same context.
+
+For each claim, return the handles that the report presents as the source of THAT claim.
+- KEEP a handle when the cited record, tool, table or timestamp is given as where this fact comes from: it is \
+named with the fact, the bullet / row / paragraph is introduced as describing that record, or the timestamp \
+is the time of the stated event or measurement.
+- DROP a handle when it belongs to a different fact in the same row or paragraph, or when the text taken as a \
+handle is itself a statement of content (a count of notes, a quoted complaint, a finding) and not a pointer \
+to a source.
+Judge only what the report presents. Do not use outside knowledge of where such a fact is usually recorded.
+
+{items}
+
+Return ONLY a JSON array with one object per claim, e.g.
+[{{"i": 1, "keep": [1, 3], "reason": "<one short sentence>"}}, {{"i": 2, "keep": [], "reason": "..."}}]
+"""
+
+
+def _phrase_only(handle: str) -> bool:
+    """A handle that is a multi-word phrase resolving only through a generic source-type word
+    ("discharge note", "labs", "orders"). A phrase that names a MIMIC table outright
+    (`labevents itemid 50971`) is a direct pointer and is not uncertain."""
+    h = handle.strip().strip("`*_[]()")
+    kinds = {k for k, _ in _handle_probes(h)}
+    return " " in h and bool(kinds) and kinds <= {"table"} and not _BARE_TABLE.search(h)
+
+
+def audit_needed(claim: dict, units: list[dict]) -> bool:
+    """Whether the rule's attachment for this claim is uncertain (see above). Decided from the
+    report text and the rule's output only, never from a verdict."""
+    if not claim.get("cited"):
+        return False
+    u = claim.get("unit", -1)
+    in_row = 0 <= u < len(units) and units[u]["text"].startswith("|")
+    return claim.get("cited_scope") in ("block", "parent") or in_row or any(_phrase_only(h) for h in claim["cited"])
+
+
+def _audit_context(units: list[dict], i: int) -> str:
+    """The claim's block, preceded by the list items it is nested under (outermost first)."""
+    if not 0 <= i < len(units):
+        return ""
+    parent_of = {u["block"]: u.get("parent") for u in units}
+    text_of = lambda b: " ".join(u["text"] for u in units if u["block"] == b)  # noqa: E731
+    parts, b, seen = [text_of(units[i]["block"])], parent_of.get(units[i]["block"]), set()
+    while b is not None and b not in seen and len(parts) < 5:
+        seen.add(b)
+        parts.insert(0, text_of(b))
+        b = parent_of.get(b)
+    return "\n".join(parts)[:_AUDIT_CONTEXT_CHARS]
+
+
+def audit_citations(client, model: str, claims: list[dict], units: list[dict]) -> dict[int, list[int]]:
+    """{claim index: zero-based indices of the handles to keep} for the uncertain claims. A claim
+    the model does not answer for keeps all its handles (the rule's answer stands)."""
+    todo = [k for k, c in enumerate(claims) if audit_needed(c, units)]
+    keep: dict[int, list[int]] = {}
+    for start in range(0, len(todo), _AUDIT_BATCH):
+        batch = todo[start : start + _AUDIT_BATCH]
+        items = []
+        for n, k in enumerate(batch, 1):
+            c = claims[k]
+            handles = "\n".join(f"  [{j}] {h}" for j, h in enumerate(c["cited"], 1))
+            items.append(f"CLAIM {n}: {c['claim']}\nHANDLES:\n{handles}\nCONTEXT:\n{_audit_context(units, c.get('unit', -1))}")
+        raw = _json_array(_call(client, model, _AUDIT_PROMPT.format(items="\n\n".join(items))))
+        for o in raw:
+            try:
+                k = batch[int(o["i"]) - 1]
+                nh = len(claims[k]["cited"])
+                keep[k] = sorted({int(j) - 1 for j in o.get("keep", []) if 1 <= int(j) <= nh})
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+    return keep
+
+
+def audit_key(claims: list[dict], judge_model: str, base_url: str = "") -> dict:
+    """Identity of an audit: the model, the prompt, and exactly which claims carried which handles."""
+    body = json.dumps([[c["claim"], c.get("unit"), c.get("cited"), c.get("cited_scope")] for c in claims])
+    return {"audit_version": AUDIT_VERSION, "judge_model": judge_model, "judge_base_url": base_url,
+            "prompt_sha": _sha(_AUDIT_PROMPT), "audit_batch": _AUDIT_BATCH, "claims_sha256": _sha(body)}
+
+
+def load_or_audit(client, model: str, claims: list[dict], units: list[dict], base_url: str,
+                  cache: Path | None) -> dict[int, list[int]]:
+    key = audit_key(claims, model, base_url)
+    if cache is not None and cache.exists():
+        try:
+            d = json.loads(cache.read_text())
+            if all(d.get(k) == v for k, v in key.items()) and isinstance(d.get("keep"), dict):
+                return {int(k): v for k, v in d["keep"].items()}
+        except (OSError, ValueError):
+            pass
+    keep = audit_citations(client, model, claims, units)
+    if cache is not None:
+        cache.write_text(json.dumps({**key, "keep": {str(k): v for k, v in keep.items()}}, indent=2))
+    return keep
+
+
+def apply_audit(claims: list[dict], units: list[dict], keep: dict[int, list[int]]) -> None:
+    """Record the rule's handles as `cited_rule`, keep only the audited ones in `cited`, and tag
+    each claim: "direct" (not uncertain, rule stands), "kept", "partial", "dropped", or "unanswered"
+    (uncertain but the model returned nothing for it; rule stands)."""
+    for k, c in enumerate(claims):
+        c["cited_rule"] = list(c.get("cited", []))
+        if not audit_needed(c, units):
+            c["audit"] = "direct" if c.get("cited") else "none"
+        elif k not in keep:
+            c["audit"] = "unanswered"
+        else:
+            kept = [c["cited_rule"][j] for j in keep[k]]
+            c["audit"] = "kept" if len(kept) == len(c["cited_rule"]) else ("partial" if kept else "dropped")
+            c["cited"] = kept
+
+
 # Claims are extracted once per report and kept next to the verdict cache, so that re-judging
 # (a resolver change, a different evidence mode) scores the same claims instead of a fresh draw.
 CLAIMS_CACHE_NAME = "insight_claims_units.json"
@@ -859,7 +996,8 @@ def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mod
         # the case ids, none of which the flattened pool text captures; `structure` is their
         # serialisation (see cited_structure), so a corrected trace re-grades.
         **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION, "units_version": UNITS_VERSION,
-            "attach_version": ATTACH_VERSION, "structure_sha": _sha(structure)}
+            "attach_version": ATTACH_VERSION, "audit_version": AUDIT_VERSION,
+            "audit_prompt_sha": _sha(_AUDIT_PROMPT), "structure_sha": _sha(structure)}
            if mode != "pool" else {}),
     }
 
@@ -923,7 +1061,7 @@ def cited_structure(observations: list, case: dict) -> str:
 
 def grade_one(report: str, pool: str, env: dict, model: str, expect: dict,
               mode: str = "pool", observations: list | None = None, case: dict | None = None,
-              claims_cache: Path | None = None) -> dict:
+              claims_cache: Path | None = None, audit_cache: Path | None = None) -> dict:
     """Score ONE trial from already-loaded inputs. Errors come back IN BAND rather than raising:
     one bad trial must not kill the pool, and `cached_ok` uses the `error` key to force a retry.
 
@@ -938,6 +1076,9 @@ def grade_one(report: str, pool: str, env: dict, model: str, expect: dict,
                 client, model, report, env.get("JUDGE_BASE_URL", ""), claims_cache)]
             for c in claims:
                 c["cited"], c["cited_scope"] = attach_citation(units, c["unit"])
+            apply_audit(claims, units, load_or_audit(
+                client, model, claims, units, env.get("JUDGE_BASE_URL", ""), audit_cache))
+            for c in claims:
                 c["pointer"] = pointer_kind(c["cited"], case or {})
             verdicts = judge_cited(client, model, claims, observations or [], case or {})
             return {**expect, **score(claims, verdicts, mode)}
@@ -1052,7 +1193,8 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
             futs = {
                 ex.submit(grade_one, report, pool, env, model, expect, mode, obs, case,
-                          tj.parents[1] / "verifier" / CLAIMS_CACHE_NAME): tj
+                          tj.parents[1] / "verifier" / CLAIMS_CACHE_NAME,
+                          tj.parents[1] / "verifier" / AUDIT_CACHE_NAME): tj
                 for tj, report, pool, expect, obs, case in todo
             }
             for n, f in enumerate(as_completed(futs), 1):
