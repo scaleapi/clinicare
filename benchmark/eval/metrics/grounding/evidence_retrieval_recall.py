@@ -18,6 +18,17 @@ CliniCARE-Bench at **source-table granularity** — the granularity the clinicia
 Everything is trace-only + deterministic (no LLM, no DB). The scenario→annotation join is on
 the task NUMBER, which both sides carry (see core.scenarios); the resolved titles are logged.
 
+Scope. A required source counts as consulted only when the call that read it was scoped to the
+case's patient: a call whose ``subject_id`` argument (or ``subject_id = N`` in a run_sql query)
+names a different patient credits nothing, and the trial's ``scope`` block counts such calls.
+Calls that name no subject_id (``get_admission_details(hadm_id=...)``, ``get_note(note_id=...)``)
+cannot be checked without the database and are credited as before; they are counted as
+``unscoped``. Encounter scope is REPORTED, not enforced: a call to another admission of the same
+patient (``hadm_id`` differs from the one the task names) is legitimate in the multi-admission
+scenarios (baseline creatinine, frequent-admitter, renal trajectory), so it is counted under
+``other_encounter`` and still credited. Temporal scope is not checked. ``--no-scope`` reproduces
+the published numbers, which applied none of this.
+
 Gold source: a committed derived JSON (build_gold.py; per scenario: title + gold source
 tables only — no clinical text). The raw annotation CSV stays local / gitignored.
 
@@ -33,6 +44,7 @@ import argparse
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from clinicare_core.paths import bootstrap
@@ -41,7 +53,14 @@ HERE = Path(__file__).resolve().parent
 
 bootstrap(__file__, "eval")
 from core.scenarios import slug_from_trial_dir, task_by_slug, task_from_title  # noqa: E402
-from core.trajectory import load_trajectory, subagent_observations  # noqa: E402
+from core.trajectory import (  # noqa: E402
+    Observation,
+    call_scope,
+    case_scope,
+    grounding_unscoreable_reason,
+    load_trajectory,
+    subagent_observations,
+)
 
 # ── tool → logical tables (vendored from mimic_tools/tool_registry.py::TOOLS[*]["tables"];
 #    re-sync if the registry changes). run_sql is empty → parsed from its query. ──────────
@@ -209,7 +228,30 @@ _FROM_RX = re.compile(r"\b(?:from|join)\s+([a-z_][a-z0-9_]*)", re.I)
 _RECOGNIZED = set(GOLD_VOCAB) | set(_CANON) | {t for tbls in TOOL_TABLES.values() for t in tbls}
 
 
-def tables_from_evidence(evidence_file: Path) -> set[str] | None:
+def _scope_stats() -> dict:
+    return {"case_subject_id": None, "case_hadm_id": None, "calls": 0, "in_scope": 0,
+            "unscoped": 0, "wrong_patient": 0, "other_encounter": 0}
+
+
+def scope_check(obs: Observation, case: dict[str, set[str]], stats: dict) -> bool:
+    """True when `obs` may credit tables: its subject_id (if it names one) is the case's patient.
+    Updates `stats`. With no case subject_id (instruction names none) every call is credited."""
+    stats["calls"] += 1
+    cs = call_scope(obs)
+    case_subj, case_hadm = case.get("subject_id") or set(), case.get("hadm_id") or set()
+    if case_hadm and cs["hadm_id"] and not cs["hadm_id"] <= case_hadm:
+        stats["other_encounter"] += 1
+    if not case_subj or not cs["subject_id"]:
+        stats["unscoped"] += 1
+        return True
+    if cs["subject_id"] <= case_subj:
+        stats["in_scope"] += 1
+        return True
+    stats["wrong_patient"] += 1
+    return False
+
+
+def tables_from_evidence(evidence_file: Path, case: dict | None = None, stats: dict | None = None) -> set[str] | None:
     """Tables read, from the in-trial ``evidence.jsonl`` (verifier/evidence.jsonl).
 
      Preferred over re-deriving from the trajectory: evidence.py extracted the CALLS in the
@@ -257,6 +299,10 @@ def tables_from_evidence(evidence_file: Path) -> set[str] | None:
         if rec.get("kind") not in ("mimic", None):
             continue  # policy / exec_output / subagent records read no MIMIC table
         tool = rec.get("tool") or ""
+        if case is not None and tool in TOOL_TABLES and not scope_check(
+            Observation(step_id=None, tool=tool, args=rec.get("args") or {}, text=""), case, stats
+        ):
+            continue  # scoped to another patient: credits nothing
         if tool == "run_sql":
             q = str(
                 (rec.get("args") or {}).get("query") or (rec.get("args") or {}).get("sql") or ""
@@ -272,9 +318,11 @@ def tables_from_evidence(evidence_file: Path) -> set[str] | None:
     return canon(raw)
 
 
-def retrieved_tables(observations) -> set[str]:
+def retrieved_tables(observations, case: dict | None = None, stats: dict | None = None) -> set[str]:
     raw: set[str] = set()
     for obs in observations:
+        if case is not None and obs.tool in TOOL_TABLES and not scope_check(obs, case, stats):
+            continue  # scoped to another patient: credits nothing
         if obs.tool == "run_sql":
             q = obs.args.get("query", "") if isinstance(obs.args, dict) else ""
             # keep only recognized MIMIC tables — filters CTE/alias/information_schema noise
@@ -307,6 +355,14 @@ def score(gold_tables: set[str], pred_tables: set[str]) -> dict:
     }
 
 
+def unscoreable_reason(trial_dir: Path, traj, subagent_recovered: bool) -> str | None:
+    """grounding_unscoreable_reason, with one addition: rows recovered from a sub-agent's own
+    session are retrieved patient records too. They stand in for a missing record only. A run
+    with no report, or with a degraded one, stays out whatever its trace holds."""
+    why = grounding_unscoreable_reason(trial_dir, traj)
+    return None if why == "no patient record" and subagent_recovered else why
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--traces", type=Path, default=HERE.parents[1] / "traces")
@@ -317,6 +373,12 @@ def main() -> int:
         help="derived gold JSON (build with build_gold.py)",
     )
     ap.add_argument("--verbose", action="store_true", help="print gold/retrieved/missed per trial")
+    ap.add_argument(
+        "--no-scope",
+        action="store_true",
+        help="credit every call regardless of the patient it names (the published behaviour)",
+    )
+    ap.add_argument("--out", type=Path, default=None, help="write per-trial scores JSON here")
     args = ap.parse_args()
 
     gold = load_gold(args.gold)
@@ -325,7 +387,7 @@ def main() -> int:
         sys.exit(f"no trajectories under {args.traces}")
 
     seen_match: dict[str, str] = {}
-    rows, recalls = [], []
+    rows, recalls, scoreable_recalls = [], [], []
     for tj in trials:
         run, slug = tj.parts[-4], tj.parts[-3]
         g = match_scenario(slug, gold)
@@ -343,8 +405,17 @@ def main() -> int:
         # Prefer the normalized in-trial artifact; fall back to trajectory parsing for traces
         # predating evidence.py.
         ev = tj.parents[1] / "verifier" / "evidence.jsonl"
-        pred = tables_from_evidence(ev)
-        s = score(g["tables"], pred if pred is not None else retrieved_tables(obs))
+        case = None if args.no_scope else case_scope(traj.steps)
+        stats = _scope_stats()
+        if case is not None:
+            stats["case_subject_id"] = sorted(case["subject_id"])
+            stats["case_hadm_id"] = sorted(case["hadm_id"])
+        pred = tables_from_evidence(ev, case, stats)
+        if pred is None:
+            stats = _scope_stats() if case is None else {**_scope_stats(), "case_subject_id": stats["case_subject_id"], "case_hadm_id": stats["case_hadm_id"]}
+            pred_traj = retrieved_tables(obs, case, stats)
+        s = score(g["tables"], pred if pred is not None else pred_traj)
+        s["scope"] = stats
         s["source"] = "evidence.jsonl" if pred is not None else "trajectory"
         s["subagent"] = traj.used_subagent
         s["subagent_recovered"] = bool(sub)
@@ -352,9 +423,15 @@ def main() -> int:
         # only the parent-visible SUMMARY of a sub-agent, never its own tool results, so the pool is
         # knowingly incomplete and a low recall would be an artifact.
         s["na"] = traj.used_subagent and not sub
+        # The paper averages the grounding metrics over grounding-scoreable runs only (report
+        # present, at least one patient record retrieved).
+        s["unscoreable_reason"] = unscoreable_reason(tj.parents[1], traj, bool(sub))
+        s["scoreable"] = s["unscoreable_reason"] is None
         rows.append((run, slug, traj.agent, s))
         if s["recall"] is not None and not s["na"]:
             recalls.append(s["recall"])
+            if s["scoreable"]:
+                scoreable_recalls.append(s["recall"])
 
     print("=== scenario → annotation join (by task number) ===")
     for slug, m in sorted(seen_match.items()):
@@ -363,17 +440,46 @@ def main() -> int:
     print(f"\n{'run':30s} {'scenario':18s} {'recall':>6s} {'missed tables'}")
     for run, slug, agent, s in rows:
         rec = "  NA" if s["na"] else (f"{s['recall']:.2f}" if s["recall"] is not None else "  -")
-        flag = ""
+        flag = "" if s["scoreable"] or s["na"] else f" [not grounding-scoreable: {s['unscoreable_reason']}]"
         if s["subagent_recovered"]:
-            flag = " [subagent calls recovered from sessions]"
+            flag += " [subagent calls recovered from sessions]"
         elif s["na"]:
-            flag = " [subagent: sessions not fetched → re-fetch to score]"
+            flag += " [subagent: sessions not fetched → re-fetch to score]"
         print(f"  {run[:28]:28s} {slug:18s} {rec:>6s} {s['missed'] or ''}{flag}")
         if args.verbose:
             print(f"      gold={s['gold']}\n      got ={s['retrieved']}")
 
+    if scoreable_recalls:
+        # R_retrieval as the paper reports it.
+        print(
+            f"\nmean recall over {len(scoreable_recalls)} grounding-scoreable trials: "
+            f"{sum(scoreable_recalls)/len(scoreable_recalls):.3f}"
+        )
     if recalls:
-        print(f"\nmean recall over {len(recalls)} trials: {sum(recalls)/len(recalls):.3f}")
+        # Say why each extra trial is outside the first mean. A trial with no patient record in
+        # the trace has recall 0; one excluded for its report keeps the recall its trace earned.
+        why = Counter(
+            s["unscoreable_reason"] for _, _, _, s in rows
+            if s["recall"] is not None and not s["na"] and not s["scoreable"]
+        )
+        detail = ", ".join(f"{n} {reason}" for reason, n in why.most_common())
+        print(
+            f"mean recall over all {len(recalls)} scored trials: {sum(recalls)/len(recalls):.3f}"
+            + (f"   (adds {sum(why.values())} not grounding-scoreable, each with the recall its trace earned: {detail})" if why else "")
+        )
+    if not args.no_scope and rows:
+        tot = {k: sum(s["scope"][k] for _, _, _, s in rows) for k in ("calls", "in_scope", "unscoped", "wrong_patient", "other_encounter")}
+        flagged = sum(1 for _, _, _, s in rows if s["scope"]["wrong_patient"])
+        print(
+            f"scope: {tot['calls']} MIMIC calls — {tot['in_scope']} on the case patient, "
+            f"{tot['unscoped']} name no subject_id, {tot['wrong_patient']} on another patient "
+            f"(in {flagged} trials); {tot['other_encounter']} name another encounter of the patient"
+        )
+    if args.out:
+        args.out.write_text(json.dumps(
+            [{"run": run, "scenario": slug, "agent": agent, **s} for run, slug, agent, s in rows], indent=1
+        ) + "\n")
+        print(f"wrote per-trial scores → {args.out}")
 
     # Found inputs but scored none => every one failed to join (missing report, no gold match).
     # Exit non-zero rather than printing an empty table and exiting 0: a silent 0/N reads as
