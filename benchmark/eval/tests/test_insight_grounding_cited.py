@@ -24,8 +24,10 @@ statement about WHICH EVIDENCE reached the judge, which is the thing under dispu
  9d. a code-mode call whose rows arrive in a later output resolves to that output.
  9f. a citation naming several sources resolves to all of them, and a parenthesis cut by the
      sentence splitter is read whole.
- 9e. uncertain attachments (paragraph / parent scope, table rows, phrase-only handles) are
-     re-audited per handle by the judge model; direct sentence citations are left to the rule.
+ 9e. uncertain attachments (paragraph / parent scope, table rows, phrase-only handles, a
+     sentence citation shared by several claims) are re-audited per handle by the judge model;
+     a sentence that makes one claim keeps the rule's citation.
+ 9g. a judge call that fails outright raises, so the trial is retried, not scored.
  10. claims are extracted once per report and reused, so re-judging scores the same claims.
 
     python benchmark/eval/tests/test_insight_grounding_cited.py
@@ -289,6 +291,25 @@ check("direct sentence citation is not uncertain", not IG.audit_needed(aclaims[0
 check("table row and paragraph fallback are uncertain", IG.audit_needed(aclaims[1], AUD) and IG.audit_needed(aclaims[2], AUD))
 check("an uncited claim is never audited", not IG.audit_needed(aclaims[3], AUD))
 check("a phrase naming a source type is uncertain", IG.audit_needed({"cited": ["only 1 discharge note and 7 radiology notes"], "cited_scope": "sentence", "unit": ai("Potassium")}, AUD))
+# A sentence that carries two claims: the lab citation belongs to one of them only.
+SH = IG.report_units("Troponin peaked at 0.42 (`labevents` itemid 51003) and an echocardiogram was performed.\n\nLactate was 4.1 (`labevents` itemid 50813).\n")
+sclaims = [{"claim": "Troponin peaked at 0.42", "unit": 0}, {"claim": "An echocardiogram was performed", "unit": 0}, {"claim": "Lactate was 4.1", "unit": 1}]
+for c in sclaims:
+    c["cited"], c["cited_scope"] = IG.attach_citation(SH, c["unit"])
+sh = IG.shared_sentence(sclaims, SH)
+check("claims that share a sentence are found", sh == {0, 1}, str(sh))
+check("a sentence citation shared by two claims is uncertain for both", IG.audit_needed(sclaims[0], SH, 0 in sh) and IG.audit_needed(sclaims[1], SH, 1 in sh))
+check("a sentence that makes one claim stays direct", not IG.audit_needed(sclaims[2], SH, 2 in sh))
+_sh_prompts: list[str] = []
+_real_call_sh = IG._call
+IG._call = lambda client, model, prompt: (_sh_prompts.append(prompt), json.dumps([{"i": 1, "keep": []}]))[1]
+kept = IG.audit_citations(None, "m", sclaims, SH, have={0: [0]})
+IG._call = _real_call_sh
+check("a claim already decided is not asked again; the new one is", len(_sh_prompts) == 1 and "CLAIM 1: An echocardiogram" in _sh_prompts[0]
+      and "Troponin peaked at 0.42\nHANDLES" not in _sh_prompts[0] and kept == {0: [0], 1: []}, str(kept))
+IG.apply_audit(sclaims, SH, kept)
+check("the echocardiogram loses the lab citation, the troponin keeps it", [c["audit"] for c in sclaims] == ["kept", "dropped", "direct"]
+      and sclaims[1]["cited"] == [] and sclaims[0]["cited"] == sclaims[0]["cited_rule"], str(sclaims))
 _real_call2 = IG._call
 _audit_prompts: list[str] = []
 
@@ -349,6 +370,26 @@ check("the claim gets the whole parenthesis, at sentence scope",
 STRAY = "- Dose given 1) at 08:00 and 2) at 10:00 (see below. Next sentence is long enough to stand alone here. And a third sentence with `get_note` in it.\n"
 su = IG.report_units(STRAY)
 check("a parenthesis that never closes joins nothing", IG.sentence_run(su, 0) == [0], str(IG.sentence_run(su, 0)))
+
+print("9g. a judge call that fails is an error, not an 'unverifiable' grade")
+_real_call_f = IG._call
+
+
+def _boom(client, model, prompt):
+    raise RuntimeError("budget exceeded")
+
+
+IG._call = _boom
+try:
+    IG.judge_claims(None, "m", ["K was 7.3"], "evidence")
+    raised = False
+except RuntimeError:
+    raised = True
+check("a failed call propagates", raised)
+IG._call = lambda client, model, prompt: "not json"
+g = IG.judge_claims(None, "m", ["K was 7.3"], "evidence")
+IG._call = _real_call_f
+check("an unreadable response is still re-rolled and left ungraded", g[0]["reason"].startswith("ungraded"), str(g))
 
 print("10. claims are extracted once and reused")
 import tempfile  # noqa: E402

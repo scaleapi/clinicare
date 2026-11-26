@@ -647,7 +647,10 @@ def extract_claims_units(client, model: str, units: list[dict]) -> list[dict]:
 #
 # A claim is UNCERTAIN, by rule and regardless of how it will be judged, when its citation came
 # from the rest of its paragraph or from an enclosing list item (scope "block" / "parent"), when
-# it was taken from a table row, or when one of its handles is only a phrase naming a source type.
+# it was taken from a table row, when one of its handles is only a phrase naming a source type,
+# or when its own sentence carries another claim: "Troponin peaked at 03:10 (`labevents`) and an
+# echocardiogram was performed" gives both claims the lab citation, and only one of them owns it.
+# A sentence that makes a single claim keeps the rule's answer.
 # For each such claim the model is shown the claim, its context and the numbered handles, and
 # returns the handles the report presents as the source of THAT claim. Handles it does not return
 # are dropped; a claim left with none is uncited. The question is asked per handle, so a row that
@@ -655,7 +658,11 @@ def extract_claims_units(client, model: str, units: list[dict]) -> list[dict]:
 #
 # On a 120-claim check asked twice the answers agreed on every claim. Decisions are cached per
 # report next to the claims, so re-judging reuses them.
-AUDIT_VERSION = 1
+#
+# Version 2 added the shared-sentence case, which a hand review of "cited, not supported" claims
+# showed version 1 was missing. The prompt is unchanged, so a version-1 cache over the same claims
+# is kept for the claims it decided and only the newly uncertain ones are asked.
+AUDIT_VERSION = 2
 AUDIT_CACHE_NAME = "insight_citation_audit.json"
 _AUDIT_BATCH = int(os.environ.get("IG_AUDIT_BATCH", "10"))
 _AUDIT_CONTEXT_CHARS = 3000
@@ -689,14 +696,26 @@ def _phrase_only(handle: str) -> bool:
     return " " in h and bool(kinds) and kinds <= {"table"} and not _BARE_TABLE.search(h)
 
 
-def audit_needed(claim: dict, units: list[dict]) -> bool:
-    """Whether the rule's attachment for this claim is uncertain (see above). Decided from the
-    report text and the rule's output only, never from a verdict."""
+def shared_sentence(claims: list[dict], units: list[dict]) -> set[int]:
+    """Indices of the claims whose sentence carries another claim as well."""
+    by_run: dict[tuple[int, ...], list[int]] = {}
+    for k, c in enumerate(claims):
+        u = c.get("unit", -1)
+        if 0 <= u < len(units):
+            by_run.setdefault(tuple(sentence_run(units, u)), []).append(k)
+    return {k for ks in by_run.values() if len(ks) > 1 for k in ks}
+
+
+def audit_needed(claim: dict, units: list[dict], shared: bool = False) -> bool:
+    """Whether the rule's attachment for this claim is uncertain (see above). `shared` says that
+    the claim's sentence carries another claim (see shared_sentence). Decided from the report
+    text and the rule's output only, never from a verdict."""
     if not claim.get("cited"):
         return False
     u = claim.get("unit", -1)
     in_row = 0 <= u < len(units) and units[u]["text"].startswith("|")
-    return claim.get("cited_scope") in ("block", "parent") or in_row or any(_phrase_only(h) for h in claim["cited"])
+    return (claim.get("cited_scope") in ("block", "parent") or in_row or shared
+            or any(_phrase_only(h) for h in claim["cited"]))
 
 
 def _audit_context(units: list[dict], i: int) -> str:
@@ -713,11 +732,14 @@ def _audit_context(units: list[dict], i: int) -> str:
     return "\n".join(parts)[:_AUDIT_CONTEXT_CHARS]
 
 
-def audit_citations(client, model: str, claims: list[dict], units: list[dict]) -> dict[int, list[int]]:
+def audit_citations(client, model: str, claims: list[dict], units: list[dict],
+                    have: dict[int, list[int]] | None = None) -> dict[int, list[int]]:
     """{claim index: zero-based indices of the handles to keep} for the uncertain claims. A claim
-    the model does not answer for keeps all its handles (the rule's answer stands)."""
-    todo = [k for k, c in enumerate(claims) if audit_needed(c, units)]
-    keep: dict[int, list[int]] = {}
+    the model does not answer for keeps all its handles (the rule's answer stands). Claims already
+    decided in `have` are not asked again."""
+    shared = shared_sentence(claims, units)
+    keep: dict[int, list[int]] = dict(have or {})
+    todo = [k for k, c in enumerate(claims) if k not in keep and audit_needed(c, units, k in shared)]
     for start in range(0, len(todo), _AUDIT_BATCH):
         batch = todo[start : start + _AUDIT_BATCH]
         items = []
@@ -746,14 +768,18 @@ def audit_key(claims: list[dict], judge_model: str, base_url: str = "") -> dict:
 def load_or_audit(client, model: str, claims: list[dict], units: list[dict], base_url: str,
                   cache: Path | None) -> dict[int, list[int]]:
     key = audit_key(claims, model, base_url)
+    have: dict[int, list[int]] = {}
     if cache is not None and cache.exists():
         try:
             d = json.loads(cache.read_text())
-            if all(d.get(k) == v for k, v in key.items()) and isinstance(d.get("keep"), dict):
-                return {int(k): v for k, v in d["keep"].items()}
+            if isinstance(d.get("keep"), dict):
+                if all(d.get(k) == v for k, v in key.items()):
+                    return {int(k): v for k, v in d["keep"].items()}
+                if all(d.get(k) == v for k, v in {**key, "audit_version": 1}.items()):
+                    have = {int(k): v for k, v in d["keep"].items()}  # same claims, same prompt
         except (OSError, ValueError):
             pass
-    keep = audit_citations(client, model, claims, units)
+    keep = audit_citations(client, model, claims, units, have)
     if cache is not None:
         cache.write_text(json.dumps({**key, "keep": {str(k): v for k, v in keep.items()}}, indent=2))
     return keep
@@ -763,9 +789,10 @@ def apply_audit(claims: list[dict], units: list[dict], keep: dict[int, list[int]
     """Record the rule's handles as `cited_rule`, keep only the audited ones in `cited`, and tag
     each claim: "direct" (not uncertain, rule stands), "kept", "partial", "dropped", or "unanswered"
     (uncertain but the model returned nothing for it; rule stands)."""
+    shared = shared_sentence(claims, units)
     for k, c in enumerate(claims):
         c["cited_rule"] = list(c.get("cited", []))
-        if not audit_needed(c, units):
+        if not audit_needed(c, units, k in shared):
             c["audit"] = "direct" if c.get("cited") else "none"
         elif k not in keep:
             c["audit"] = "unanswered"
@@ -832,14 +859,16 @@ Return ONLY a JSON array, one object per claim IN ORDER:
 def _judge_batch(client, model: str, claims: list[str], evidence: str) -> list[dict]:
     """Grade one small batch of claims against one evidence chunk. Retries if the response
     doesn't cover all indices (long arrays occasionally truncate / re-number) so a dropped
-    index becomes a re-roll, not a silent 'no grade' that would deflate the score."""
+    index becomes a re-roll, not a silent 'no grade' that would deflate the score. A call that
+    fails outright (after `_call`'s own retries) is raised, so the trial is recorded as an error
+    and graded again on the next run; only an unreadable response is re-rolled here."""
     numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(claims))
     prompt = _JUDGE_PROMPT.format(evidence=evidence, claims=numbered)
     best_by_i: dict[int, dict] = {}
     for _ in range(_MAX_RETRIES):
         try:
             out = _json_array(_call(client, model, prompt))
-        except Exception:  # noqa: BLE001  (parse failure → re-roll)
+        except ValueError:  # parse failure → re-roll
             continue
         for o in out:
             if isinstance(o, dict) and "i" in o:

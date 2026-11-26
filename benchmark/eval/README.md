@@ -175,8 +175,9 @@ python $G/insight_grounding_llm.py --traces <traces> --limit 3 --verbose
 #                     coverage_sentence / citation_precision_sentence are the sentence-only
 #                     reading). Claims are extracted once per report (insight_claims_units.json)
 #                     and reused, so re-judging scores the same claims.
-#                     Indirect attachments (paragraph / parent scope, table rows, phrase-only
-#                     handles) are re-audited by the judge model per handle before judging
+#                     Uncertain attachments (paragraph / parent scope, table rows, phrase-only
+#                     handles, a sentence citation shared by several claims) are re-audited by
+#                     the judge model per handle before judging
 #                     (insight_citation_audit.json; `audit` and `cited_rule` per claim).
 #                     The judge sees each cited record with the tool call and arguments that
 #                     produced it; a code-mode call whose rows arrive in a later output is
