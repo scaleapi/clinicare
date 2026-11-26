@@ -659,9 +659,8 @@ def extract_claims_units(client, model: str, units: list[dict]) -> list[dict]:
 # On a 120-claim check asked twice the answers agreed on every claim. Decisions are cached per
 # report next to the claims, so re-judging reuses them.
 #
-# Version 2 added the shared-sentence case, which a hand review of "cited, not supported" claims
-# showed version 1 was missing. The prompt is unchanged, so a version-1 cache over the same claims
-# is kept for the claims it decided and only the newly uncertain ones are asked.
+# Version 2 added the shared-sentence case, which reading "cited, not supported" claims against
+# their reports showed version 1 was missing.
 AUDIT_VERSION = 2
 AUDIT_CACHE_NAME = "insight_citation_audit.json"
 _AUDIT_BATCH = int(os.environ.get("IG_AUDIT_BATCH", "10"))
@@ -732,14 +731,12 @@ def _audit_context(units: list[dict], i: int) -> str:
     return "\n".join(parts)[:_AUDIT_CONTEXT_CHARS]
 
 
-def audit_citations(client, model: str, claims: list[dict], units: list[dict],
-                    have: dict[int, list[int]] | None = None) -> dict[int, list[int]]:
+def audit_citations(client, model: str, claims: list[dict], units: list[dict]) -> dict[int, list[int]]:
     """{claim index: zero-based indices of the handles to keep} for the uncertain claims. A claim
-    the model does not answer for keeps all its handles (the rule's answer stands). Claims already
-    decided in `have` are not asked again."""
+    the model does not answer for keeps all its handles (the rule's answer stands)."""
     shared = shared_sentence(claims, units)
-    keep: dict[int, list[int]] = dict(have or {})
-    todo = [k for k, c in enumerate(claims) if k not in keep and audit_needed(c, units, k in shared)]
+    keep: dict[int, list[int]] = {}
+    todo = [k for k, c in enumerate(claims) if audit_needed(c, units, k in shared)]
     for start in range(0, len(todo), _AUDIT_BATCH):
         batch = todo[start : start + _AUDIT_BATCH]
         items = []
@@ -758,28 +755,29 @@ def audit_citations(client, model: str, claims: list[dict], units: list[dict],
     return keep
 
 
-def audit_key(claims: list[dict], judge_model: str, base_url: str = "") -> dict:
-    """Identity of an audit: the model, the prompt, and exactly which claims carried which handles."""
+def audit_key(claims: list[dict], units: list[dict], judge_model: str, base_url: str = "") -> dict:
+    """Identity of an audit: the model, the prompt, exactly which claims carried which handles,
+    and the report text the model is shown as their context. The units are hashed whole, because a
+    claim's context is its paragraph and the list items above it: a report edited in a way that
+    leaves the claims and handles as they were can still move a citation to another fact."""
     body = json.dumps([[c["claim"], c.get("unit"), c.get("cited"), c.get("cited_scope")] for c in claims])
+    text = json.dumps([[u["text"], u["block"], u.get("parent")] for u in units])
     return {"audit_version": AUDIT_VERSION, "judge_model": judge_model, "judge_base_url": base_url,
-            "prompt_sha": _sha(_AUDIT_PROMPT), "audit_batch": _AUDIT_BATCH, "claims_sha256": _sha(body)}
+            "prompt_sha": _sha(_AUDIT_PROMPT), "audit_batch": _AUDIT_BATCH, "claims_sha256": _sha(body),
+            "units_sha256": _sha(text)}
 
 
 def load_or_audit(client, model: str, claims: list[dict], units: list[dict], base_url: str,
                   cache: Path | None) -> dict[int, list[int]]:
-    key = audit_key(claims, model, base_url)
-    have: dict[int, list[int]] = {}
+    key = audit_key(claims, units, model, base_url)
     if cache is not None and cache.exists():
         try:
             d = json.loads(cache.read_text())
-            if isinstance(d.get("keep"), dict):
-                if all(d.get(k) == v for k, v in key.items()):
-                    return {int(k): v for k, v in d["keep"].items()}
-                if all(d.get(k) == v for k, v in {**key, "audit_version": 1}.items()):
-                    have = {int(k): v for k, v in d["keep"].items()}  # same claims, same prompt
+            if all(d.get(k) == v for k, v in key.items()) and isinstance(d.get("keep"), dict):
+                return {int(k): v for k, v in d["keep"].items()}
         except (OSError, ValueError):
             pass
-    keep = audit_citations(client, model, claims, units, have)
+    keep = audit_citations(client, model, claims, units)
     if cache is not None:
         cache.write_text(json.dumps({**key, "keep": {str(k): v for k, v in keep.items()}}, indent=2))
     return keep
@@ -1073,7 +1071,10 @@ def inputs_key(report: str, pool: str, judge_model: str, base_url: str = "", mod
         # serialisation (see cited_structure), so a corrected trace re-grades.
         **({"evidence_mode": mode, "resolver_version": RESOLVER_VERSION, "units_version": UNITS_VERSION,
             "attach_version": ATTACH_VERSION, "audit_version": AUDIT_VERSION,
-            "audit_prompt_sha": _sha(_AUDIT_PROMPT), "structure_sha": _sha(structure)}
+            # The audit has its own cache and key, but a hit on THIS key returns the score without
+            # reaching it, so what changes an audit decision has to be here too.
+            "audit_prompt_sha": _sha(_AUDIT_PROMPT), "audit_batch": _AUDIT_BATCH,
+            "structure_sha": _sha(structure)}
            if mode != "pool" else {}),
     }
 

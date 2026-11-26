@@ -29,6 +29,7 @@ statement about WHICH EVIDENCE reached the judge, which is the thing under dispu
      a sentence that makes one claim keeps the rule's citation.
  9g. a judge call that fails outright raises, so the trial is retried, not scored.
  10. claims are extracted once per report and reused, so re-judging scores the same claims.
+ 11. the summary table averages every system over the same cases.
 
     python benchmark/eval/tests/test_insight_grounding_cited.py
 """
@@ -302,14 +303,27 @@ check("a sentence citation shared by two claims is uncertain for both", IG.audit
 check("a sentence that makes one claim stays direct", not IG.audit_needed(sclaims[2], SH, 2 in sh))
 _sh_prompts: list[str] = []
 _real_call_sh = IG._call
-IG._call = lambda client, model, prompt: (_sh_prompts.append(prompt), json.dumps([{"i": 1, "keep": []}]))[1]
-kept = IG.audit_citations(None, "m", sclaims, SH, have={0: [0]})
+IG._call = lambda client, model, prompt: (_sh_prompts.append(prompt), json.dumps([{"i": 1, "keep": [1]}, {"i": 2, "keep": []}]))[1]
+kept = IG.audit_citations(None, "m", sclaims, SH)
 IG._call = _real_call_sh
-check("a claim already decided is not asked again; the new one is", len(_sh_prompts) == 1 and "CLAIM 1: An echocardiogram" in _sh_prompts[0]
-      and "Troponin peaked at 0.42\nHANDLES" not in _sh_prompts[0] and kept == {0: [0], 1: []}, str(kept))
+check("both claims of the shared sentence are asked, the single-claim sentence is not", len(_sh_prompts) == 1
+      and "CLAIM 1: Troponin" in _sh_prompts[0] and "CLAIM 2: An echocardiogram" in _sh_prompts[0]
+      and "Lactate was 4.1\nHANDLES" not in _sh_prompts[0] and kept == {0: [0], 1: []}, str(kept))
 IG.apply_audit(sclaims, SH, kept)
 check("the echocardiogram loses the lab citation, the troponin keeps it", [c["audit"] for c in sclaims] == ["kept", "dropped", "direct"]
       and sclaims[1]["cited"] == [] and sclaims[0]["cited"] == sclaims[0]["cited_rule"], str(sclaims))
+# The audit is keyed on the report text the model is shown, not only on the claims and handles.
+SH2 = IG.report_units("Troponin peaked at 0.42 and an echocardiogram (`labevents` itemid 51003) was performed.\n\nLactate was 4.1 (`labevents` itemid 50813).\n")
+raw = [{"claim": c["claim"], "unit": c["unit"], "cited": c["cited_rule"], "cited_scope": c["cited_scope"]} for c in sclaims]
+k1, k2 = IG.audit_key(raw, SH, "m"), IG.audit_key(raw, SH2, "m")
+check("same claims and handles in an edited report: the audit is not reused", k1["claims_sha256"] == k2["claims_sha256"] and k1 != k2)
+_b = IG._AUDIT_BATCH
+key_a = IG.inputs_key("r", "p", "m", "", "cited", "s")
+IG._AUDIT_BATCH = _b + 1
+key_b = IG.inputs_key("r", "p", "m", "", "cited", "s")
+IG._AUDIT_BATCH = _b
+check("a different audit batch size is a different grading", key_a != key_b and key_a["audit_batch"] == _b)
+check("pool-mode keys are untouched", "audit_batch" not in IG.inputs_key("r", "p", "m"))
 _real_call2 = IG._call
 _audit_prompts: list[str] = []
 
@@ -422,6 +436,44 @@ sc = IG.score(
 check("coverage counts every claim with a citation, matched or not", abs(sc["coverage"] - 0.75) < 1e-9, str(sc["coverage"]))
 check("citation precision is over cited claims only", abs(sc["citation_precision"] - 1 / 3) < 1e-9, str(sc["citation_precision"]))
 check("sentence-only pair", abs(sc["coverage_sentence"] - 0.5) < 1e-9 and abs(sc["citation_precision_sentence"] - 0.5) < 1e-9, str(sc))
+
+print("11. the summary table averages every system over the same cases")
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+import citation_table as CT  # noqa: E402
+
+
+def _cited_result(n_supported: int) -> dict:
+    det = [{"citation_kind": "pointer", "cited_scope": "sentence", "pointer": "record",
+            "verdict": "supported" if k < n_supported else "unverifiable"} for k in range(4)]
+    return {"n_claims": 4, "detail": det}
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    lines = ["family,run,scenario,case,trial"]
+    for run, fam in (("sysA", "famA"), ("sysB", "famB")):
+        for case in ("c1", "c2"):
+            lines.append(f"{fam},{run},s,{case},{case}__x")
+            v = root / run / f"{case}__x" / "verifier"
+            v.mkdir(parents=True)
+            # sysA is perfect on c1 and poor on c2; sysB has only c1 (its c2 grading failed).
+            if run == "sysB" and case == "c2":
+                (v / CT.CACHE).write_text(json.dumps({"error": "judge call failed"}))
+            else:
+                (v / CT.CACHE).write_text(json.dumps(_cited_result(4 if case == "c1" else 1)))
+    (root / "m.csv").write_text("\n".join(lines) + "\n")
+    argv, sys.argv = sys.argv, ["citation_table.py", "--traces", str(root), "--manifest", str(root / "m.csv"),
+                                "--out", str(root / "t.json"), "--n-boot", "10"]
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = CT.main()
+    sys.argv = argv
+    tab = {r["run"]: r for r in json.loads((root / "t.json").read_text())}
+    check("a case one system lacks is left out for every system", tab["sysA"]["n"] == 1 and tab["sysB"]["n"] == 1, str(tab))
+    check("so both systems are compared on c1 alone", tab["sysA"]["precision"] == 1.0 and tab["sysB"]["precision"] == 1.0, str(tab))
+    check("the dropped case is named and the exit status says the table is partial", rc == 1 and "c2" in err.getvalue(), err.getvalue())
 
 print()
 if _fails:

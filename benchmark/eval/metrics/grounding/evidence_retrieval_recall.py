@@ -44,6 +44,7 @@ import argparse
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from clinicare_core.paths import bootstrap
@@ -56,7 +57,7 @@ from core.trajectory import (  # noqa: E402
     Observation,
     call_scope,
     case_scope,
-    grounding_scoreable,
+    grounding_unscoreable_reason,
     load_trajectory,
     subagent_observations,
 )
@@ -354,6 +355,14 @@ def score(gold_tables: set[str], pred_tables: set[str]) -> dict:
     }
 
 
+def unscoreable_reason(trial_dir: Path, traj, subagent_recovered: bool) -> str | None:
+    """grounding_unscoreable_reason, with one addition: rows recovered from a sub-agent's own
+    session are retrieved patient records too. They stand in for a missing record only. A run
+    with no report, or with a degraded one, stays out whatever its trace holds."""
+    why = grounding_unscoreable_reason(trial_dir, traj)
+    return None if why == "no patient record" and subagent_recovered else why
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--traces", type=Path, default=HERE.parents[1] / "traces")
@@ -415,10 +424,9 @@ def main() -> int:
         # knowingly incomplete and a low recall would be an artifact.
         s["na"] = traj.used_subagent and not sub
         # The paper averages the grounding metrics over grounding-scoreable runs only (report
-        # present, at least one patient record retrieved). Recovered sub-agent rows count.
-        s["scoreable"] = grounding_scoreable(tj.parents[1], traj) or (
-            bool(sub) and (tj.parents[1] / "verifier" / "report.md").exists()
-        )
+        # present, at least one patient record retrieved).
+        s["unscoreable_reason"] = unscoreable_reason(tj.parents[1], traj, bool(sub))
+        s["scoreable"] = s["unscoreable_reason"] is None
         rows.append((run, slug, traj.agent, s))
         if s["recall"] is not None and not s["na"]:
             recalls.append(s["recall"])
@@ -432,7 +440,7 @@ def main() -> int:
     print(f"\n{'run':30s} {'scenario':18s} {'recall':>6s} {'missed tables'}")
     for run, slug, agent, s in rows:
         rec = "  NA" if s["na"] else (f"{s['recall']:.2f}" if s["recall"] is not None else "  -")
-        flag = "" if s["scoreable"] or s["na"] else " [not grounding-scoreable: no patient record in the trace]"
+        flag = "" if s["scoreable"] or s["na"] else f" [not grounding-scoreable: {s['unscoreable_reason']}]"
         if s["subagent_recovered"]:
             flag += " [subagent calls recovered from sessions]"
         elif s["na"]:
@@ -448,10 +456,16 @@ def main() -> int:
             f"{sum(scoreable_recalls)/len(scoreable_recalls):.3f}"
         )
     if recalls:
-        dropped = len(recalls) - len(scoreable_recalls)
+        # Say why each extra trial is outside the first mean. A trial with no patient record in
+        # the trace has recall 0; one excluded for its report keeps the recall its trace earned.
+        why = Counter(
+            s["unscoreable_reason"] for _, _, _, s in rows
+            if s["recall"] is not None and not s["na"] and not s["scoreable"]
+        )
+        detail = ", ".join(f"{n} {reason}" for reason, n in why.most_common())
         print(
             f"mean recall over all {len(recalls)} scored trials: {sum(recalls)/len(recalls):.3f}"
-            + (f"   ({dropped} with no patient record in the trace count as 0 here)" if dropped else "")
+            + (f"   (adds {sum(why.values())} not grounding-scoreable, each with the recall its trace earned: {detail})" if why else "")
         )
     if not args.no_scope and rows:
         tot = {k: sum(s["scope"][k] for _, _, _, s in rows) for k in ("calls", "in_scope", "unscoped", "wrong_patient", "other_encounter")}

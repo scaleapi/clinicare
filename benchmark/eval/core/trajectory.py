@@ -464,28 +464,42 @@ class Trajectory:
         return [o for o in self.observations if o.tool == normalize_tool(tool)]
 
 
-def grounding_scoreable(trial_dir, traj: "Trajectory | None" = None) -> bool:
-    """The paper's grounding-scoreable run: a report is present and the agent retrieved at least
-    one patient record. The four patient-evidence grounding metrics are averaged over these runs
-    only. A run in which the trace records no patient-data result (the agent worked through shell
-    commands or an unrecovered sub-agent, or wrote a report without looking anything up) has
-    nothing to score: counting it as zero coverage would measure the trace, not the retrieval.
+def grounding_unscoreable_reason(trial_dir, traj: Trajectory | None = None) -> str | None:
+    """Why a run is not grounding-scoreable, or None when it is: "no report", "degraded report"
+    or "no patient record". The report is checked first, so nothing found in the trace can make a
+    run with a missing or degraded report scoreable.
+
+    The paper's grounding-scoreable run has a report and at least one retrieved patient record.
+    The four patient-evidence grounding metrics are averaged over these runs only. A run in which
+    the trace records no patient-data result (the agent worked through shell commands or an
+    unrecovered sub-agent, or wrote a report without looking anything up) has nothing to score:
+    counting it as zero coverage would measure the trace, not the retrieval.
 
     Code mode records a MIMIC call with empty text and its rows in a pooled exec output, so a
-    call plus a non-empty exec output also counts as a retrieved record."""
+    call plus a non-empty exec output also counts as a retrieved record.
+
+    Any non-empty result of a patient-data tool counts, including an error message. That is the
+    rule the published numbers were computed with, and it is kept so that they reproduce. It
+    admits a run whose only recorded patient-data call failed and whose agent then worked
+    through the shell."""
     trial_dir = Path(trial_dir)
     report = trial_dir / "verifier" / "report.md"
     tj = trial_dir / "agent" / "trajectory.json"
     if not report.exists() or not tj.exists():
-        return False
+        return "no report"
     if "Environment: degraded" in report.read_text(errors="replace"):
-        return False
+        return "degraded report"
     obs = (traj or load_trajectory(tj)).observations
     if any(o.tool in MIMIC_TOOLS and o.text.strip() for o in obs):
-        return True
-    return any(o.tool in MIMIC_TOOLS for o in obs) and any(
-        o.tool == EXEC_OUTPUT_TOOL and o.text.strip() for o in obs
-    )
+        return None
+    if any(o.tool in MIMIC_TOOLS for o in obs) and any(o.tool == EXEC_OUTPUT_TOOL and o.text.strip() for o in obs):
+        return None
+    return "no patient record"
+
+
+def grounding_scoreable(trial_dir, traj: Trajectory | None = None) -> bool:
+    """Whether the run enters the paper's grounding means (see grounding_unscoreable_reason)."""
+    return grounding_unscoreable_reason(trial_dir, traj) is None
 
 
 def subagent_observations(trial_dir) -> list[Observation]:

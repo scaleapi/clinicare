@@ -5,6 +5,9 @@ the trials in a paired manifest (sample_reports.py --paired-per-scenario) and pr
 system: coverage and precision with percentile-bootstrap intervals over cases, the sentence-only
 reading of both, and the share of claims whose only citation is a date. No judge calls.
 
+Every system is averaged over the same cases. A case without a usable result for some system is
+left out for all of them and listed, and the exit status is 1.
+
   python benchmark/eval/metrics/grounding/citation_table.py \\
       --traces <dir with the arms> --manifest paired_manifest.csv [--out table.json]
 
@@ -64,26 +67,39 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
-    per_run: dict[str, list[dict]] = defaultdict(list)
+    # One usable result per (system, case). A comparison between systems is only paired when
+    # every system is averaged over the same cases, so a case that any system lacks (a grading
+    # run that stopped early, a judge error) is left out for all of them and named.
+    results: dict[str, dict[str, dict]] = defaultdict(dict)
     family: dict[str, str] = {}
-    missing = 0
+    cases: list[str] = []
     for m in csv.DictReader(args.manifest.open()):
+        family[m["run"]] = m["family"]
+        if m["case"] not in cases:
+            cases.append(m["case"])
         f = args.traces / m["run"] / m["trial"] / "verifier" / CACHE
         try:
             d = json.loads(f.read_text())
         except (OSError, ValueError):
-            missing += 1
             continue
         if d.get("error") or not d.get("n_claims"):
-            missing += 1
             continue
-        per_run[m["run"]].append(report_stats(d))
-        family[m["run"]] = m["family"]
-    if missing:
-        print(f"  ! {missing} trials have no usable {CACHE}", file=sys.stderr)
-    if not per_run:
+        results[m["run"]][m["case"]] = report_stats(d)
+    if not results:
         print("no cited-mode results found for the manifest", file=sys.stderr)
         return 2
+    complete = [c for c in cases if all(c in results[run] for run in family)]
+    dropped = [c for c in cases if c not in complete]
+    if dropped:
+        lacking = {run: sum(c not in results[run] for c in cases) for run in family}
+        print(f"  ! {len(dropped)} of {len(cases)} cases lack a usable {CACHE} for at least one system and are "
+              f"left out for every system: {', '.join(dropped)}", file=sys.stderr)
+        print("    missing per system: " + ", ".join(f"{r} {n}" for r, n in sorted(lacking.items()) if n), file=sys.stderr)
+    if not complete:
+        print("no case has a usable result for every system", file=sys.stderr)
+        return 2
+    per_run = {run: [results[run][c] for c in complete] for run in family}
+    print(f"cases scored for every system: {len(complete)} of {len(cases)}")
 
     rows = []
     print(f"{'family':12s} {'run':40s} {'n':>3s} {'coverage':>8s} {'95% CI':>15s} {'precision':>9s} {'95% CI':>15s} "
@@ -107,7 +123,7 @@ def main() -> int:
         print(f"  {fam:12s} coverage {mean([r['coverage'] for r in fr]):.3f}   precision {mean([r['precision'] for r in fr]):.3f}")
     if args.out:
         args.out.write_text(json.dumps(rows, indent=1) + "\n")
-    return 0
+    return 1 if dropped else 0   # a table over fewer cases than the manifest is not the full result
 
 
 if __name__ == "__main__":

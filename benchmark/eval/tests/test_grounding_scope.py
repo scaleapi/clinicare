@@ -173,6 +173,14 @@ with tempfile.TemporaryDirectory() as d:
     check("no report: not scoreable", not grounding_scoreable(trial_dir(d, "c", traj, report=None)))
     check("a degraded-environment report: not scoreable",
           not grounding_scoreable(trial_dir(d, "e", traj, report="Environment: degraded\n")))
+    from core.trajectory import grounding_unscoreable_reason
+    from evidence_retrieval_recall import unscoreable_reason
+    check("each exclusion carries its reason",
+          [grounding_unscoreable_reason(Path(d) / n) for n in "abce"] == [None, "no patient record", "no report", "degraded report"])
+    check("rows recovered from a sub-agent stand in for a missing patient record",
+          unscoreable_reason(Path(d) / "b", None, True) is None and unscoreable_reason(Path(d) / "b", None, False) == "no patient record")
+    check("but never for a missing or degraded report",
+          unscoreable_reason(Path(d) / "c", None, True) == "no report" and unscoreable_reason(Path(d) / "e", None, True) == "degraded report")
 
 print()
 if _fails:

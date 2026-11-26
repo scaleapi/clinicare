@@ -149,11 +149,15 @@ python benchmark/eval/gold/build_gold.py --annotation <your-copy.csv>
 #    (subject_id in the typed args or in the run_sql text); calls that name no subject_id are
 #    credited and counted `unscoped`; another encounter of the same patient is counted, not
 #    penalised. --no-scope reproduces the published behaviour; --out writes per-trial JSON.
-#    Two means are printed. The first is over grounding-scoreable trials (report present, at
-#    least one patient record in the trace) and is the number the paper reports. The second is
-#    over every scored trial and counts a trial with no patient record in its trace as 0; the
-#    two differ where an agent worked through shell commands or a sub-agent (about 5% of
-#    opencode runs).
+#    Two means are printed. The first is over grounding-scoreable trials (report present and
+#    not degraded, at least one patient record in the trace) and is the number the paper
+#    reports. The second is over every scored trial; the trials it adds are counted by reason,
+#    and one with no patient record in its trace has recall 0. The two differ where an agent
+#    worked through shell commands or a sub-agent (about 5% of opencode runs).
+#    Any non-empty result of a patient-data tool counts as a record, an error message included.
+#    That is the rule behind the published numbers and is kept so they reproduce; it admits
+#    a run whose only recorded patient-data call failed and whose agent then worked through
+#    the shell.
 python $G/evidence_retrieval_recall.py --traces <traces> [--no-scope] [--out rr.json]
 
 # 4. insight_grounding T1 — trace-only, no gold, no LLM
@@ -185,6 +189,11 @@ python $G/insight_grounding_llm.py --traces <traces> --limit 3 --verbose
 #                     A citation that names several sources, `(tool; note id)` or
 #                     `tool_a, tool_b`, resolves to each of them, and a parenthesis the
 #                     sentence splitter cut at ";" is read whole.
+#                     Two limits are kept as scored for the paper. A month-day or clock
+#                     time without a year (`11-12 13:35`) is not a citation: the rule counts
+#                     record ids, tools, tables and full dates. A sentence that names only
+#                     the case's own ids does not fall back to its paragraph's citation and
+#                     is uncited (at most 0.3% of claims on the paired sample).
 #    --trials-from F  grade only the trial dirs listed in F (see sample_reports.py)
 python $G/insight_grounding_llm.py --traces <traces> --evidence cited --trials-from sample.txt
 #    Paired sample + per-system table (citation coverage / citation precision, same cases for
