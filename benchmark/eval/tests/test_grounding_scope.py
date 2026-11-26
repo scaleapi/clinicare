@@ -99,6 +99,12 @@ check("'subject_id N' form, no hadm", c2["subject_id"] == {"16474066"} and not c
 check("no instruction → empty scope, every call credited",
       retrieved_tables([obs("get_lab_timeline", {"subject_id": 1})], case_scope([]), _scope_stats()) == {"labevents"})
 
+codex_steps = [{"source": "system", "message": "<permissions instructions>"},
+               {"source": "user", "message": "<environment_context>\n  <cwd>/workspace</cwd>\n</environment_context>"},
+               {"source": "user", "message": msg_eq}, {"source": "agent", "message": "subject_id=5"}]
+check("Codex: the instruction follows an environment-context user message and is still found",
+      case_scope(codex_steps) == c1, str(case_scope(codex_steps)))
+
 print("6. bash code mode (mini-swe-agent)")
 script = (
     "cd /workspace && python3 <<'PYEOF'\nfrom mimic_tools import mcp_server\n"

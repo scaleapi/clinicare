@@ -313,14 +313,23 @@ _CASE_RX = {
 def case_scope(steps) -> dict[str, set[str]]:
     """{"subject_id": {...}, "hadm_id": {...}, "stay_id": {...}} named by the task instruction.
 
-    The instruction is the first ``source == "user"`` step; the case sentence precedes the
-    ``---`` that opens the environment boilerplate (which names no ids). Every scenario names
-    the patient (``subject_id=12014968`` or ``For subject_id 16474066``); most name the index
-    admission; ED scenarios name a stay. An empty set means the instruction names none, and a
-    scope check must then abstain rather than flag."""
-    msg = next((s.get("message") or "" for s in steps if s.get("source") == "user"), "")
-    head = msg.split("\n---", 1)[0]
-    return {k: set(rx.findall(head)) for k, rx in _CASE_RX.items()}
+    The instruction is the first ``source == "user"`` step that names an id. It is not always
+    the first user step: Codex opens with an ``<environment_context>`` user message and the task
+    follows it, so taking the first user step left every Codex case with no ids. The case
+    sentence precedes the ``---`` that opens the environment boilerplate (which names no ids).
+    Every scenario names the patient (``subject_id=12014968`` or ``For subject_id 16474066``);
+    most name the index admission; ED scenarios name a stay. An empty set means no user step
+    names an id, and a scope check must then abstain rather than flag."""
+    empty: dict[str, set[str]] = {k: set() for k in _CASE_RX}
+    for s in steps:
+        if s.get("source") != "user":
+            continue
+        msg = s.get("message")
+        head = (msg if isinstance(msg, str) else "").split("\n---", 1)[0]
+        found = {k: set(rx.findall(head)) for k, rx in _CASE_RX.items()}
+        if any(found.values()):
+            return found
+    return empty
 
 
 def call_scope(obs: Observation) -> dict[str, set[str]]:
